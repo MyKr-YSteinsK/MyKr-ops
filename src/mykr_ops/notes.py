@@ -503,7 +503,14 @@ def apply_notes(
                 logger, level=logging.INFO, run_id=run_id, action="move", status="prepared",
                 source=item.source, destination=destination,
             )
-            move_file_without_overwrite(item.source, destination, item.source_sha256)
+            move_file_without_overwrite(
+                item.source,
+                destination,
+                item.source_sha256,
+                expected_size=item.source_size,
+                expected_mtime_ns=item.source_mtime_ns,
+            )
+            assert_within(destination, config.study_root)
             database.update_operation_status(prepared_operation_id, "success")
             item.destination = destination
             item.status = PlanStatus.READY
@@ -633,6 +640,7 @@ def undo_latest(
                 source=destination, destination=source,
             )
             move_file_without_overwrite(destination, source, expected_sha256)
+            assert_within(source, config.source_dir)
             database.finalize_undo_operation(prepared_operation_id, int(operation["id"]), run_id)
             results.append(UndoItem(destination, source, "success"))
             _log_operation(

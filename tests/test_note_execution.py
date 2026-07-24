@@ -75,7 +75,7 @@ def test_apply_continues_after_one_move_failure(tmp_path: Path, monkeypatch: pyt
     write_note(config, "02-Works_CS_Course.md")
     actual_move = notes.move_file_without_overwrite
 
-    def fail_first(source: Path, destination: Path, digest: str) -> None:
+    def fail_first(source: Path, destination: Path, digest: str, **_: object) -> None:
         if source.name.startswith("01-"):
             raise notes.FilesystemSafetyError("simulated locked file")
         actual_move(source, destination, digest)
@@ -113,7 +113,7 @@ def test_apply_records_success_and_failure_operations(tmp_path: Path, monkeypatc
     database = database_for(tmp_path)
     actual_move = notes.move_file_without_overwrite
 
-    def fail_bad(source: Path, destination: Path, digest: str) -> None:
+    def fail_bad(source: Path, destination: Path, digest: str, **_: object) -> None:
         if source.name.startswith("02-"):
             raise notes.FilesystemSafetyError("locked")
         actual_move(source, destination, digest)
@@ -134,7 +134,7 @@ def test_apply_removes_empty_current_run_directories_after_all_moves_fail(
     config = make_config(tmp_path)
     write_note(config, "01-Topic_CS_Course.md")
 
-    def fail_move(_: Path, __: Path, ___: str) -> None:
+    def fail_move(_: Path, __: Path, ___: str, **____: object) -> None:
         raise notes.FilesystemSafetyError("locked")
 
     monkeypatch.setattr(notes, "move_file_without_overwrite", fail_move)
