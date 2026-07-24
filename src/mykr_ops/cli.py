@@ -6,10 +6,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .database import Database
+from .database import Database, DatabaseSchemaError, MutationLockError
 from .filesystem import FilesystemSafetyError
 from .models import PlanResult, PlanStatus, RunResult, UndoResult
-from .notes import apply_notes, history_rows, plan_notes, undo_latest
+from .notes import RecoveryRequiredError, apply_notes, history_rows, plan_notes, undo_latest
 from .settings import SettingsError, application_data_dir, load_notes_config
 
 
@@ -128,18 +128,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         state_dir = application_data_dir(create=True)
-        logger = _configure_logger(state_dir)
         database = Database(state_dir / "mykr-ops.db")
-        if args.command == "notes":
-            result = apply_notes(config, database, logger)
-            logger.info("run_id=%s command=notes status failed=%s", result.run_id, result.failed_count)
-            _print_apply(result)
+        with database.mutation_lock():
+            logger = _configure_logger(state_dir)
+            if args.command == "notes":
+                result = apply_notes(config, database, logger, lock_held=True)
+                logger.info("run_id=%s command=notes status failed=%s", result.run_id, result.failed_count)
+                _print_apply(result)
+                return 1 if result.failed_count else 0
+            result = undo_latest(config, database, logger, lock_held=True)
+            logger.info("run_id=%s command=undo status failed=%s", result.run_id, result.failed_count)
+            _print_undo(result)
             return 1 if result.failed_count else 0
-        result = undo_latest(config, database, logger)
-        logger.info("run_id=%s command=undo status failed=%s", result.run_id, result.failed_count)
-        _print_undo(result)
-        return 1 if result.failed_count else 0
-    except (FilesystemSafetyError, SettingsError, sqlite3.Error, OSError) as exc:
+    except (
+        DatabaseSchemaError,
+        FilesystemSafetyError,
+        MutationLockError,
+        RecoveryRequiredError,
+        SettingsError,
+        sqlite3.Error,
+        OSError,
+    ) as exc:
         if logger:
             logger.exception("command failed: %s", exc)
         print(f"error: {exc}", file=sys.stderr)

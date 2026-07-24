@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Iterable
 
-from .database import Database
+from .database import Database, DatabaseSchemaError, MutationLockError
 from .filesystem import (
     FilesystemSafetyError,
     assert_ordinary_directory,
@@ -56,6 +57,19 @@ class DirectoryCreationError(FilesystemSafetyError):
     def __init__(self, message: str, created_directories: list[Path]) -> None:
         super().__init__(message)
         self.created_directories = created_directories
+
+
+class RecoveryRequiredError(RuntimeError):
+    """Raised when durable operation records cannot be reconciled safely."""
+
+    def __init__(self, operations: list[object]) -> None:
+        self.operations = operations
+        identifiers = ", ".join(
+            f"run {operation['run_id']} operation {operation['id']}" for operation in operations
+        )
+        super().__init__(
+            f"manual recovery is required for {identifiers}; inspect history and resolve the filesystem state"
+        )
 
 
 def _is_reserved_windows_name(component: str) -> bool:
@@ -301,33 +315,162 @@ def _log_operation(
         )
 
 
-def apply_notes(
+def _operation_roots(operation: object, config: NotesConfig) -> tuple[Path, Path]:
+    if operation["action"] == "move":
+        return config.source_dir, config.study_root
+    if operation["action"] == "undo_move":
+        return config.study_root, config.source_dir
+    raise FilesystemSafetyError(f"operation {operation['id']} cannot be reconciled as a file move")
+
+
+def _file_state(path: Path, expected_sha256: str) -> str:
+    if not path_exists_no_follow(path):
+        return "absent"
+    if not is_ordinary_file(path):
+        return "not an ordinary file"
+    try:
+        return "matches" if sha256_file(path) == expected_sha256 else "hash differs"
+    except OSError as exc:
+        return f"cannot be read ({exc})"
+
+
+def _classify_prepared_operation(operation: object, config: NotesConfig) -> tuple[str, str]:
+    """Classify a durable move record without changing the filesystem."""
+    try:
+        source = Path(operation["source_path"])
+        destination = Path(operation["destination_path"])
+        expected_sha256 = operation["sha256"]
+        if not expected_sha256:
+            raise FilesystemSafetyError("record is missing its expected SHA-256")
+        source_root, destination_root = _operation_roots(operation, config)
+        assert_within(source, source_root)
+        assert_within(destination, destination_root)
+        source_state = _file_state(source, expected_sha256)
+        destination_state = _file_state(destination, expected_sha256)
+    except (FilesystemSafetyError, OSError, TypeError) as exc:
+        return "recovery_required", f"paths cannot be inspected safely: {exc}"
+
+    if source_state == "matches" and destination_state == "absent":
+        return "failed", "recovery confirmed that the move did not complete"
+    if source_state == "absent" and destination_state == "matches":
+        return "success", "recovery confirmed that the move completed"
+    return (
+        "recovery_required",
+        f"ambiguous filesystem state: source is {source_state}; destination is {destination_state}",
+    )
+
+
+def _finalize_recovered_runs(database: Database, recovered_run_ids: set[int]) -> None:
+    runs_by_id = {int(run["id"]): run for run in database.running_runs()}
+    for run_id in recovered_run_ids:
+        run = database.get_run(run_id)
+        if run is not None:
+            runs_by_id[run_id] = run
+    for run in runs_by_id.values():
+        action = "move" if run["mode"] == "apply" else "undo_move"
+        counts = database.operation_counts_for_run(int(run["id"]), action)
+        recorded_count = sum(counts.values())
+        expected_count = int(run["matched_count"])
+        moved_count = counts.get("success", 0)
+        failed_count = counts.get("failed", 0) + counts.get("recovery_required", 0)
+        incomplete = recorded_count < expected_count or counts.get("prepared", 0) > 0
+        if not incomplete and failed_count == 0:
+            status = "success"
+        elif moved_count > 0 or counts.get("recovery_required", 0) > 0 or incomplete:
+            status = "partial"
+        else:
+            status = "failed"
+        summary = (
+            "Recovered after interruption: "
+            f"recorded={recorded_count} of expected={expected_count}; "
+            f"success={moved_count}; failed={counts.get('failed', 0)}; "
+            f"recovery_required={counts.get('recovery_required', 0)}"
+        )
+        database.finish_run(
+            int(run["id"]),
+            status=status,
+            summary=summary,
+            matched_count=expected_count,
+            moved_count=moved_count,
+            duplicate_count=counts.get("duplicate", 0),
+            conflict_count=counts.get("conflict", 0),
+            invalid_count=counts.get("invalid", 0),
+            failed_count=failed_count,
+            created_dir_count=int(run["created_dir_count"]),
+        )
+
+
+def recover_interrupted_operations(
     config: NotesConfig, database: Database, logger: logging.Logger | None = None
+) -> None:
+    """Reconcile durable prepared records without moving or deleting any files."""
+    database.initialize()
+    recovered_run_ids: set[int] = set()
+    for operation in database.prepared_or_recovery_operations():
+        status, reason = _classify_prepared_operation(operation, config)
+        if operation["action"] == "undo_move" and status == "success":
+            database.finalize_undo_operation(
+                int(operation["id"]), int(operation["related_operation_id"]), int(operation["run_id"])
+            )
+        else:
+            database.update_operation_status(int(operation["id"]), status, reason)
+        recovered_run_ids.add(int(operation["run_id"]))
+        _log_operation(
+            logger,
+            level=logging.INFO if status == "success" else logging.ERROR,
+            run_id=int(operation["run_id"]),
+            action=str(operation["action"]),
+            status=status,
+            source=Path(operation["source_path"]) if operation["source_path"] else None,
+            destination=Path(operation["destination_path"]) if operation["destination_path"] else None,
+            reason=f"recovered: {reason}",
+        )
+    _finalize_recovered_runs(database, recovered_run_ids)
+    blocked = database.recovery_required_operations()
+    if blocked:
+        _log_operation(
+            logger,
+            level=logging.ERROR,
+            run_id=int(blocked[0]["run_id"]),
+            action="recovery",
+            status="blocked",
+            source=None,
+            destination=None,
+            reason="manual recovery is required before a new mutation",
+        )
+        raise RecoveryRequiredError(blocked)
+
+
+def apply_notes(
+    config: NotesConfig,
+    database: Database,
+    logger: logging.Logger | None = None,
+    *,
+    lock_held: bool = False,
 ) -> RunResult:
-    """Rescan and safely apply every ready plan item, recording actual results."""
+    """Rescan and safely apply every ready item with durable prepared records."""
+    if not lock_held:
+        with database.mutation_lock():
+            return apply_notes(config, database, logger, lock_held=True)
+
+    recover_interrupted_operations(config, database, logger)
     plan = plan_notes(config)
-    run_id = database.create_run("notes", "apply")
+    run_id = database.create_run("notes", "apply", matched_count=plan.matched_count)
     created_directories: list[Path] = []
 
     for sequence_index, item in enumerate(plan.items, start=1):
         if item.status != PlanStatus.READY:
             _record_item(database, run_id, sequence_index, item)
             _log_operation(
-                logger,
-                level=logging.INFO,
-                run_id=run_id,
-                action="move",
-                status=item.status.lower(),
-                source=item.source,
-                destination=item.destination,
-                reason=item.reason,
+                logger, level=logging.INFO, run_id=run_id, action="move",
+                status=item.status.lower(), source=item.source, destination=item.destination, reason=item.reason,
             )
             continue
+
+        prepared_operation_id: int | None = None
         try:
             if (
-                item.parsed is None
-                or item.source_size is None
-                or item.source_mtime_ns is None
+                item.parsed is None or item.source_size is None or item.source_mtime_ns is None
                 or item.source_sha256 is None
             ):
                 raise FilesystemSafetyError("planned item is missing source verification data")
@@ -336,52 +479,60 @@ def apply_notes(
             created_directories.extend(just_created)
             for directory in just_created:
                 database.record_operation(
-                    run_id=run_id,
-                    sequence_index=sequence_index,
-                    action="mkdir",
-                    status="success",
+                    run_id=run_id, sequence_index=sequence_index, action="mkdir", status="success",
                     destination_path=directory,
                 )
                 _log_operation(
-                    logger,
-                    level=logging.INFO,
-                    run_id=run_id,
-                    action="mkdir",
-                    status="success",
-                    source=None,
-                    destination=directory,
+                    logger, level=logging.INFO, run_id=run_id, action="mkdir", status="success",
+                    source=None, destination=directory,
                 )
             assert_within(destination, config.study_root)
             _target_is_absent(destination)
-            # Check the source one last time after any directory work.
             snapshot_matches(item.source, item.source_size, item.source_mtime_ns, item.source_sha256)
+            prepared_operation_id = database.prepare_operation(
+                run_id=run_id,
+                sequence_index=sequence_index,
+                action="move",
+                source_path=item.source,
+                destination_path=destination,
+                file_size=item.source_size,
+                source_mtime_ns=item.source_mtime_ns,
+                sha256=item.source_sha256,
+            )
+            _log_operation(
+                logger, level=logging.INFO, run_id=run_id, action="move", status="prepared",
+                source=item.source, destination=destination,
+            )
             move_file_without_overwrite(item.source, destination, item.source_sha256)
+            database.update_operation_status(prepared_operation_id, "success")
             item.destination = destination
             item.status = PlanStatus.READY
             item.reason = None
+        except sqlite3.Error:
+            # A prepared row is deliberately left durable for the next mutating startup.
+            raise
         except (FilesystemSafetyError, OSError) as exc:
             if isinstance(exc, DirectoryCreationError):
                 for directory in exc.created_directories:
                     created_directories.append(directory)
                     database.record_operation(
-                        run_id=run_id,
-                        sequence_index=sequence_index,
-                        action="mkdir",
-                        status="success",
+                        run_id=run_id, sequence_index=sequence_index, action="mkdir", status="success",
                         destination_path=directory,
                     )
-                    _log_operation(
-                        logger,
-                        level=logging.INFO,
-                        run_id=run_id,
-                        action="mkdir",
-                        status="success",
-                        source=None,
-                        destination=directory,
-                    )
-            item.status = PlanStatus.FAILED
-            item.reason = str(exc)
-        _record_item(database, run_id, sequence_index, item)
+            if prepared_operation_id is not None:
+                prepared = next(
+                    operation for operation in database.operations_for_run(run_id)
+                    if int(operation["id"]) == prepared_operation_id
+                )
+                recovered_status, recovered_reason = _classify_prepared_operation(prepared, config)
+                database.update_operation_status(prepared_operation_id, recovered_status, recovered_reason)
+                item.destination = Path(prepared["destination_path"])
+                item.status = PlanStatus.READY if recovered_status == "success" else PlanStatus.FAILED
+                item.reason = None if recovered_status == "success" else recovered_reason
+            else:
+                item.status = PlanStatus.FAILED
+                item.reason = str(exc)
+                _record_item(database, run_id, sequence_index, item)
         _log_operation(
             logger,
             level=logging.INFO if item.status == PlanStatus.READY else logging.ERROR,
@@ -393,12 +544,10 @@ def apply_notes(
             reason=item.reason,
         )
 
-    # Created paths are only removed when this run created them and they remain empty.
     for directory in sorted(set(created_directories), key=lambda path: len(path.parts), reverse=True):
         try:
             remove_empty_directory(directory, config.study_root)
         except FilesystemSafetyError:
-            # The original mkdir record remains; an unsafe changed state is left untouched.
             pass
 
     counts = Counter(item.status for item in plan.items)
@@ -413,28 +562,15 @@ def apply_notes(
         f"created_directories={len(created_directories)}"
     )
     database.finish_run(
-        run_id,
-        status=_status_for_apply(moved_count, failed_count),
-        summary=summary,
-        matched_count=plan.matched_count,
-        moved_count=moved_count,
-        duplicate_count=duplicate_count,
-        conflict_count=conflict_count,
-        invalid_count=invalid_count,
-        failed_count=failed_count,
+        run_id, status=_status_for_apply(moved_count, failed_count), summary=summary,
+        matched_count=plan.matched_count, moved_count=moved_count, duplicate_count=duplicate_count,
+        conflict_count=conflict_count, invalid_count=invalid_count, failed_count=failed_count,
         created_dir_count=len(created_directories),
     )
     return RunResult(
-        run_id=run_id,
-        items=plan.items,
-        matched_count=plan.matched_count,
-        moved_count=moved_count,
-        duplicate_count=duplicate_count,
-        conflict_count=conflict_count,
-        invalid_count=invalid_count,
-        failed_count=failed_count,
-        created_dir_count=len(created_directories),
-        ignored_count=plan.ignored_count,
+        run_id=run_id, items=plan.items, matched_count=plan.matched_count, moved_count=moved_count,
+        duplicate_count=duplicate_count, conflict_count=conflict_count, invalid_count=invalid_count,
+        failed_count=failed_count, created_dir_count=len(created_directories), ignored_count=plan.ignored_count,
     )
 
 
@@ -451,73 +587,90 @@ def _validate_undo_paths(source: Path, destination: Path, config: NotesConfig, e
 
 
 def undo_latest(
-    config: NotesConfig, database: Database | None, logger: logging.Logger | None = None
+    config: NotesConfig,
+    database: Database | None,
+    logger: logging.Logger | None = None,
+    *,
+    lock_held: bool = False,
 ) -> UndoResult:
-    """Undo the latest apply run that still has successful moves remaining."""
+    """Undo the latest eligible apply run with durable prepared undo records."""
     if database is None or not database.path.exists():
         return UndoResult(None, None, [], 0, 0, 0, "No eligible apply run to undo.")
+    if not lock_held:
+        with database.mutation_lock():
+            return undo_latest(config, database, logger, lock_held=True)
+
+    recover_interrupted_operations(config, database, logger)
     apply_run = database.latest_eligible_apply_run()
     if apply_run is None:
         return UndoResult(None, None, [], 0, 0, 0, "No eligible apply run to undo.")
 
     _validate_roots(config)
     apply_run_id = int(apply_run["id"])
-    run_id = database.create_run("undo", "undo")
-    results: list[UndoItem] = []
     successful_moves = database.successful_moves_for_run(apply_run_id)
+    run_id = database.create_run("undo", "undo", matched_count=len(successful_moves))
+    results: list[UndoItem] = []
     for sequence_index, operation in enumerate(successful_moves, start=1):
         source = Path(operation["source_path"])
         destination = Path(operation["destination_path"])
         expected_sha256 = operation["sha256"]
+        prepared_operation_id: int | None = None
         try:
             if not expected_sha256:
                 raise FilesystemSafetyError("recorded move is missing its SHA-256")
             _validate_undo_paths(source, destination, config, expected_sha256)
-            move_file_without_overwrite(destination, source, expected_sha256)
-            database.record_operation(
+            prepared_operation_id = database.prepare_operation(
                 run_id=run_id,
                 sequence_index=sequence_index,
                 action="undo_move",
-                status="success",
                 source_path=destination,
                 destination_path=source,
                 sha256=expected_sha256,
                 related_operation_id=int(operation["id"]),
             )
-            database.mark_move_undone(int(operation["id"]), run_id)
+            _log_operation(
+                logger, level=logging.INFO, run_id=run_id, action="undo_move", status="prepared",
+                source=destination, destination=source,
+            )
+            move_file_without_overwrite(destination, source, expected_sha256)
+            database.finalize_undo_operation(prepared_operation_id, int(operation["id"]), run_id)
             results.append(UndoItem(destination, source, "success"))
             _log_operation(
-                logger,
-                level=logging.INFO,
-                run_id=run_id,
-                action="undo_move",
-                status="success",
-                source=destination,
-                destination=source,
+                logger, level=logging.INFO, run_id=run_id, action="undo_move", status="success",
+                source=destination, destination=source,
             )
+        except sqlite3.Error:
+            raise
         except (FilesystemSafetyError, OSError) as exc:
             reason = str(exc)
-            database.record_operation(
-                run_id=run_id,
-                sequence_index=sequence_index,
-                action="undo_move",
-                status="failed",
-                source_path=destination,
-                destination_path=source,
-                sha256=expected_sha256,
-                reason=reason,
-                related_operation_id=int(operation["id"]),
-            )
-            results.append(UndoItem(destination, source, "failed", reason))
+            if prepared_operation_id is not None:
+                prepared = next(
+                    operation_row for operation_row in database.operations_for_run(run_id)
+                    if int(operation_row["id"]) == prepared_operation_id
+                )
+                recovered_status, recovered_reason = _classify_prepared_operation(prepared, config)
+                if recovered_status == "success":
+                    database.finalize_undo_operation(prepared_operation_id, int(operation["id"]), run_id)
+                    results.append(UndoItem(destination, source, "success"))
+                    continue
+                database.update_operation_status(prepared_operation_id, recovered_status, recovered_reason)
+                results.append(UndoItem(destination, source, "failed", recovered_reason))
+            else:
+                database.record_operation(
+                    run_id=run_id,
+                    sequence_index=sequence_index,
+                    action="undo_move",
+                    status="failed",
+                    source_path=destination,
+                    destination_path=source,
+                    sha256=expected_sha256,
+                    reason=reason,
+                    related_operation_id=int(operation["id"]),
+                )
+                results.append(UndoItem(destination, source, "failed", reason))
             _log_operation(
-                logger,
-                level=logging.ERROR,
-                run_id=run_id,
-                action="undo_move",
-                status="failed",
-                source=destination,
-                destination=source,
-                reason=reason,
+                logger, level=logging.ERROR, run_id=run_id, action="undo_move", status="failed",
+                source=destination, destination=source, reason=results[-1].reason,
             )
 
     removed_dir_count = 0

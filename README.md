@@ -55,6 +55,8 @@ mykr-ops history
 mykr-ops history --run 12
 ```
 
+Before an apply or undo move, MyKr-ops commits a prepared operation record and holds an exclusive local mutation lock. If a previous command was interrupted, the next apply or undo first reconciles the recorded source and destination paths using SHA-256. Confirmed completed moves are restored to normal history; ambiguous states are marked `recovery_required`, leave both paths untouched, and block new file changes until you manually resolve the filesystem state and rerun the command. `history` shows these states for inspection.
+
 Apply and undo records are stored in `%LOCALAPPDATA%\mykr-ops\mykr-ops.db` (or `%USERPROFILE%\.mykr-ops\mykr-ops.db` when `LOCALAPPDATA` is unavailable). Logs are written alongside it as `mykr-ops.log`. The included `scripts\preview-notes.cmd` and `scripts\apply-notes.cmd` wrappers are suitable for double-click use and stay open after printing results.
 
 ## Tests
