@@ -88,6 +88,43 @@ def create_phase1_database(path: Path, config: NotesConfig) -> None:
     connection.close()
 
 
+def create_phase2a_database(path: Path, config: NotesConfig) -> None:
+    create_phase1_database(path, config)
+    connection = sqlite3.connect(path)
+    connection.execute("ALTER TABLE operations RENAME TO operations_phase1")
+    connection.execute(
+        """
+        CREATE TABLE operations (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL,
+            sequence_index INTEGER NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('move', 'mkdir', 'undo_move', 'undo_rmdir')),
+            source_path TEXT,
+            destination_path TEXT,
+            file_size INTEGER,
+            source_mtime_ns INTEGER,
+            sha256 TEXT,
+            status TEXT NOT NULL CHECK (status IN ('prepared', 'success', 'duplicate', 'conflict', 'invalid', 'failed', 'skipped', 'recovery_required')),
+            reason TEXT,
+            related_operation_id INTEGER,
+            undone_at TEXT,
+            undo_run_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO operations
+        SELECT * FROM operations_phase1
+        """
+    )
+    connection.execute("DROP TABLE operations_phase1")
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+
 def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     path = tmp_path / "state" / "mykr-ops.db"
@@ -98,9 +135,9 @@ def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_
     database.initialize()
 
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
     row = connection.execute(
-        "SELECT id, source_path, destination_path, sha256, undone_at FROM operations WHERE id = 11"
+        "SELECT id, source_path, destination_path, sha256, undone_at, error_type FROM operations WHERE id = 11"
     ).fetchone()
     undo_metadata = connection.execute(
         "SELECT related_operation_id, undone_at, undo_run_id FROM operations WHERE id = 13"
@@ -111,6 +148,7 @@ def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_
     assert row[2].endswith("01-Topic.md")
     assert row[3]
     assert row[4] is None
+    assert row[5] is None
     assert tuple(undo_metadata) == (12, "2026-01-01T00:00:02+00:00", 12)
     assert database.get_run(7) is not None
 
@@ -118,6 +156,29 @@ def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_
     assert undo.moved_count == 1
     apply = notes.apply_notes(config, database)
     assert apply.moved_count == 1
+
+
+def test_phase2a_database_gains_error_type_without_losing_history(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    path = tmp_path / "state" / "mykr-ops.db"
+    path.parent.mkdir()
+    create_phase2a_database(path, config)
+
+    database = Database(path)
+    database.initialize()
+
+    connection = sqlite3.connect(path)
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    row = connection.execute(
+        "SELECT id, source_path, destination_path, sha256, error_type FROM operations WHERE id = 11"
+    ).fetchone()
+    connection.close()
+    assert version == 2
+    assert row[0] == 11
+    assert row[1].endswith("01-Topic_CS_Course.md")
+    assert row[2].endswith("01-Topic.md")
+    assert row[3]
+    assert row[4] is None
 
 
 def test_unknown_schema_stops_safely(tmp_path: Path) -> None:

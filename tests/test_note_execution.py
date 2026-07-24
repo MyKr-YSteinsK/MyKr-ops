@@ -126,6 +126,9 @@ def test_apply_records_success_and_failure_operations(tmp_path: Path, monkeypatc
         "success",
         "failed",
     }
+    by_source = {Path(operation["source_path"]).name: operation for operation in operations if operation["action"] == "move"}
+    assert by_source["01-Good_CS_Course.md"]["error_type"] is None
+    assert by_source["02-Bad_CS_Course.md"]["error_type"] == "source_locked"
 
 
 def test_apply_removes_empty_current_run_directories_after_all_moves_fail(

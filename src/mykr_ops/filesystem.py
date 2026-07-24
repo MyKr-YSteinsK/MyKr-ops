@@ -13,6 +13,10 @@ FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 class FilesystemSafetyError(RuntimeError):
     """Raised when a filesystem state cannot be handled safely."""
 
+    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
 
 def path_exists_no_follow(path: Path) -> bool:
     return os.path.lexists(path)
@@ -46,7 +50,10 @@ def is_ordinary_directory(path: Path) -> bool:
 def assert_ordinary_directory(path: Path, description: str) -> None:
     if not is_ordinary_directory(path):
         if path_exists_no_follow(path) and is_reparse_point(path):
-            raise FilesystemSafetyError(f"{description} is a symbolic link, junction, or reparse point")
+            raise FilesystemSafetyError(
+                f"{description} is a symbolic link, junction, or reparse point",
+                error_type="unsafe_reparse_point",
+            )
         raise FilesystemSafetyError(f"{description} is not an ordinary directory")
     try:
         with os.scandir(path):
@@ -62,7 +69,9 @@ def assert_within(path: Path, root: Path) -> None:
         resolved_path = path.resolve(strict=False)
         resolved_path.relative_to(resolved_root)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise FilesystemSafetyError(f"path escapes configured root: {path}") from exc
+        raise FilesystemSafetyError(
+            f"path escapes configured root: {path}", error_type="path_escape"
+        ) from exc
 
 
 def sha256_file(path: Path) -> str:
@@ -140,15 +149,19 @@ def remove_empty_directory(path: Path, root: Path) -> bool:
 
 def snapshot_matches(path: Path, expected_size: int, expected_mtime_ns: int, expected_sha256: str) -> None:
     if not is_ordinary_file(path):
-        raise FilesystemSafetyError(f"source is no longer an ordinary file: {path}")
+        raise FilesystemSafetyError(
+            f"source is no longer an ordinary file: {path}", error_type="source_missing"
+        )
     try:
         metadata = path.stat()
     except OSError as exc:
         raise FilesystemSafetyError(f"could not stat source {path}: {exc}") from exc
     if metadata.st_size != expected_size or metadata.st_mtime_ns != expected_mtime_ns:
-        raise FilesystemSafetyError(f"source changed after planning: {path}")
+        raise FilesystemSafetyError(f"source changed after planning: {path}", error_type="source_changed")
     if sha256_file(path) != expected_sha256:
-        raise FilesystemSafetyError(f"source content changed after planning: {path}")
+        raise FilesystemSafetyError(
+            f"source content changed after planning: {path}", error_type="source_changed"
+        )
 
 
 def move_file_without_overwrite(
@@ -166,10 +179,12 @@ def move_file_without_overwrite(
     checked and committed.  The non-Windows path exists only for portable test coverage.
     """
     if not is_ordinary_file(source):
-        raise FilesystemSafetyError(f"source is not an ordinary file: {source}")
+        raise FilesystemSafetyError(f"source is not an ordinary file: {source}", error_type="source_missing")
     assert_ordinary_directory(destination.parent, f"destination directory {destination.parent}")
     if path_exists_no_follow(destination):
-        raise FilesystemSafetyError(f"destination already exists: {destination}")
+        raise FilesystemSafetyError(
+            f"destination already exists: {destination}", error_type="destination_exists"
+        )
     try:
         source_metadata = source.lstat()
     except OSError as exc:
@@ -309,14 +324,21 @@ def _move_file_windows(
         )
         if source_identity[0] != parent_identity[0]:
             raise FilesystemSafetyError(
-                f"source and destination are on different volumes: {source} -> {destination}"
+                f"source and destination are on different volumes: {source} -> {destination}",
+                error_type="cross_volume",
             )
         if source_identity[2] != expected_size or source_identity[3] != expected_mtime_ns:
-            raise FilesystemSafetyError(f"source changed after planning: {source}")
+            raise FilesystemSafetyError(
+                f"source changed after planning: {source}", error_type="source_changed"
+            )
         if _hash_handle(source_handle, f"source {source}") != expected_sha256:
-            raise FilesystemSafetyError(f"source content changed after planning: {source}")
+            raise FilesystemSafetyError(
+                f"source content changed after planning: {source}", error_type="source_changed"
+            )
         if path_exists_no_follow(destination):
-            raise FilesystemSafetyError(f"destination already exists: {destination}")
+            raise FilesystemSafetyError(
+                f"destination already exists: {destination}", error_type="destination_exists"
+            )
 
         _rename_handle_without_overwrite(source_handle, destination_parent_handle, destination)
 
@@ -443,9 +465,18 @@ def _rename_handle_without_overwrite(source_handle: int, _parent_handle: int, de
 def _raise_windows_error(message: str) -> None:
     error = ctypes.get_last_error()
     if error in {_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS}:
-        raise FilesystemSafetyError(f"destination already exists ({message})")
+        raise FilesystemSafetyError(
+            f"destination already exists ({message})", error_type="destination_exists"
+        )
     if error == _ERROR_NOT_SAME_DEVICE:
-        raise FilesystemSafetyError(f"cross-volume moves are not supported: {message}")
+        raise FilesystemSafetyError(
+            f"cross-volume moves are not supported: {message}", error_type="cross_volume"
+        )
     if error in {_ERROR_SHARING_VIOLATION, _ERROR_LOCK_VIOLATION}:
-        raise FilesystemSafetyError(f"file is locked or cannot be safely shared: {message}")
-    raise FilesystemSafetyError(f"{message}: Windows error {error}")
+        error_type = "destination_locked" if "destination" in message.casefold() else "source_locked"
+        raise FilesystemSafetyError(
+            f"file is locked or cannot be safely shared: {message}", error_type=error_type
+        )
+    raise FilesystemSafetyError(
+        f"{message}: Windows error {error}", error_type="unknown_filesystem_error"
+    )

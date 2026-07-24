@@ -144,6 +144,7 @@ def test_confirmed_pre_move_state_recovers_as_failed_without_file_changes(tmp_pa
     assert source.read_text(encoding="utf-8") == "note"
     assert not destination.exists()
     assert operation(database, run_id)["status"] == "failed"
+    assert operation(database, run_id)["error_type"] == "unknown_filesystem_error"
 
 
 @pytest.mark.parametrize(
@@ -181,6 +182,7 @@ def test_ambiguous_prepared_states_require_manual_recovery(tmp_path: Path, state
         notes.recover_interrupted_operations(config, database)
 
     assert operation(database, run_id)["status"] == "recovery_required"
+    assert operation(database, run_id)["error_type"] == "recovery_ambiguous"
     assert not source.exists() or source.read_text(encoding="utf-8") in {"note", "changed"}
     assert not destination.exists() or destination.is_dir() or destination.read_text(encoding="utf-8") in {"note", "different"}
     with pytest.raises(notes.RecoveryRequiredError):

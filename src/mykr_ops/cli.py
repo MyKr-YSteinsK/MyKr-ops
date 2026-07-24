@@ -105,6 +105,7 @@ def _print_history(database: Database | None, run_id: int | None) -> None:
         print(
             f"  {operation['action']} {operation['status']}: "
             f"{operation['source_path']} -> {operation['destination_path']}"
+            + (f" [error_type={operation['error_type']}]" if operation["error_type"] else "")
             + (f" ({operation['reason']})" if operation['reason'] else "")
         )
 
@@ -150,7 +151,11 @@ def main(argv: list[str] | None = None) -> int:
         OSError,
     ) as exc:
         if logger:
-            logger.exception("command failed: %s", exc)
+            error_type = (
+                "database_error" if isinstance(exc, sqlite3.Error)
+                else getattr(exc, "error_type", None) or "unknown_filesystem_error"
+            )
+            logger.exception("command failed: error_type=%s error=%s", error_type, exc)
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

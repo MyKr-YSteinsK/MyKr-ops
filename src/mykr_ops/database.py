@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OPERATION_STATUSES = (
     "prepared",
     "success",
@@ -104,6 +104,9 @@ class Database:
         if version == 0:
             self._migrate_phase1_schema(connection)
             return
+        if version == 1:
+            self._migrate_phase2a_schema(connection)
+            return
         if version != SCHEMA_VERSION:
             raise DatabaseSchemaError(f"database schema version {version} is not recognized")
         self._validate_latest_schema(connection)
@@ -150,6 +153,7 @@ class Database:
                 sha256 TEXT,
                 status TEXT NOT NULL CHECK (status IN ({status_values})),
                 reason TEXT,
+                error_type TEXT,
                 related_operation_id INTEGER,
                 undone_at TEXT,
                 undo_run_id INTEGER,
@@ -216,10 +220,31 @@ class Database:
             connection.rollback()
             raise DatabaseSchemaError(f"could not migrate the Phase 1 database safely: {exc}") from exc
 
-    def _validate_latest_schema(self, connection: sqlite3.Connection) -> None:
+    def _migrate_phase2a_schema(self, connection: sqlite3.Connection) -> None:
         required_operations = {
             "id", "run_id", "sequence_index", "action", "source_path", "destination_path",
             "file_size", "source_mtime_ns", "sha256", "status", "reason", "related_operation_id",
+            "undone_at", "undo_run_id", "created_at",
+        }
+        columns = self._columns(connection, "operations")
+        if not required_operations.issubset(columns) or "error_type" in columns:
+            raise DatabaseSchemaError("existing version-1 database is not the expected Phase 2A schema")
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+        ).fetchone()["sql"].casefold()
+        if "prepared" not in definition or "recovery_required" not in definition:
+            raise DatabaseSchemaError("existing version-1 operation status schema is not recognized")
+        try:
+            with connection:
+                connection.execute("ALTER TABLE operations ADD COLUMN error_type TEXT")
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise DatabaseSchemaError(f"could not migrate the Phase 2A database safely: {exc}") from exc
+
+    def _validate_latest_schema(self, connection: sqlite3.Connection) -> None:
+        required_operations = {
+            "id", "run_id", "sequence_index", "action", "source_path", "destination_path",
+            "file_size", "source_mtime_ns", "sha256", "status", "reason", "error_type", "related_operation_id",
             "undone_at", "undo_run_id", "created_at",
         }
         if not required_operations.issubset(self._columns(connection, "operations")):
@@ -262,30 +287,33 @@ class Database:
                          source_path: Path | None = None, destination_path: Path | None = None,
                          file_size: int | None = None, source_mtime_ns: int | None = None,
                          sha256: str | None = None, reason: str | None = None,
+                         error_type: str | None = None,
                          related_operation_id: int | None = None) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO operations (
                     run_id, sequence_index, action, source_path, destination_path, file_size,
-                    source_mtime_ns, sha256, status, reason, related_operation_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_mtime_ns, sha256, status, reason, error_type, related_operation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (run_id, sequence_index, action,
                  str(source_path) if source_path is not None else None,
                  str(destination_path) if destination_path is not None else None,
-                 file_size, source_mtime_ns, sha256, status, reason, related_operation_id, utc_now()),
+                 file_size, source_mtime_ns, sha256, status, reason, error_type, related_operation_id, utc_now()),
             )
             return int(cursor.lastrowid)
 
     def prepare_operation(self, **kwargs: object) -> int:
         return self.record_operation(status="prepared", **kwargs)
 
-    def update_operation_status(self, operation_id: int, status: str, reason: str | None = None) -> None:
+    def update_operation_status(
+        self, operation_id: int, status: str, reason: str | None = None, error_type: str | None = None
+    ) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE operations SET status = ?, reason = ? WHERE id = ?",
-                (status, reason, operation_id),
+                "UPDATE operations SET status = ?, reason = ?, error_type = ? WHERE id = ?",
+                (status, reason, error_type, operation_id),
             )
             if cursor.rowcount != 1:
                 raise DatabaseSchemaError(f"operation {operation_id} no longer exists")
@@ -295,7 +323,7 @@ class Database:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 updated_undo = connection.execute(
-                    "UPDATE operations SET status = 'success', reason = NULL WHERE id = ?",
+                    "UPDATE operations SET status = 'success', reason = NULL, error_type = NULL WHERE id = ?",
                     (undo_operation_id,),
                 ).rowcount
                 updated_apply = connection.execute(
