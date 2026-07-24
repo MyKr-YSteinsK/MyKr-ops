@@ -1,0 +1,28 @@
+﻿# Temporary Codex plans
+.handoff/
+
+# Python virtual environment
+.venv/
+
+# Python cache and tests
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Local configuration and runtime state
+config.toml
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Editors and Windows
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
