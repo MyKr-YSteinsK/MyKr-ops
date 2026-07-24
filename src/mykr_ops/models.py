@@ -41,6 +41,7 @@ class PlanItem:
     reason: str | None = None
     source_size: int | None = None
     source_mtime_ns: int | None = None
+    # Preview-ready items with no existing target defer hashing until apply verification.
     source_sha256: str | None = None
     planned_directories: tuple[Path, ...] = ()
 

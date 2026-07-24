@@ -84,6 +84,9 @@ def test_marks_invalid_note_attempt(tmp_path: Path) -> None:
 def test_marks_hashing_error_as_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = make_config(tmp_path)
     write_note(config, "01-Topic_CS_Course.md")
+    target = config.study_root / "CS" / "Course" / "01-Topic.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("existing", encoding="utf-8")
 
     def fail_hash(_: Path) -> str:
         raise OSError("locked")

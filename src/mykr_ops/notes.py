@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 import logging
 import sqlite3
 from pathlib import Path
@@ -16,6 +16,7 @@ from .filesystem import (
     is_ordinary_file,
     is_reparse_point,
     move_file_without_overwrite,
+    names_equal,
     path_exists_no_follow,
     remove_empty_directory,
     resolve_child_directory,
@@ -246,6 +247,8 @@ def _inspect_target(item: PlanItem, config: NotesConfig) -> None:
         item.reason = "target is not an ordinary file"
         return
     try:
+        if item.source_sha256 is None:
+            item.source_sha256 = sha256_file(item.source)
         if sha256_file(target) == item.source_sha256:
             item.status = PlanStatus.DUPLICATE
             item.reason = "target already exists with identical SHA-256 content"
@@ -286,7 +289,6 @@ def plan_notes(config: NotesConfig) -> PlanResult:
             metadata = source.stat()
             item.source_size = metadata.st_size
             item.source_mtime_ns = metadata.st_mtime_ns
-            item.source_sha256 = sha256_file(source)
             item.destination, item.planned_directories = _resolve_destination(parsed, config)
             _inspect_target(item, config)
         except (FilesystemSafetyError, OSError) as exc:
@@ -294,16 +296,27 @@ def plan_notes(config: NotesConfig) -> PlanResult:
             item.reason = str(exc)
         result.items.append(item)
 
-    competing: dict[str, list[PlanItem]] = defaultdict(list)
+    competing: list[list[PlanItem]] = []
     for item in result.items:
         if item.status == PlanStatus.READY and item.destination is not None:
-            competing[str(item.destination).casefold()].append(item)
-    for items in competing.values():
+            for group in competing:
+                if _same_destination_name(item.destination, group[0].destination):
+                    group.append(item)
+                    break
+            else:
+                competing.append([item])
+    for items in competing:
         if len(items) > 1:
             for item in items:
                 item.status = PlanStatus.CONFLICT
                 item.reason = "multiple source files resolve to the same target"
     return result
+
+
+def _same_destination_name(left: Path, right: Path) -> bool:
+    return len(left.parts) == len(right.parts) and all(
+        names_equal(left_part, right_part) for left_part, right_part in zip(left.parts, right.parts)
+    )
 
 
 def _record_item(
@@ -360,6 +373,27 @@ def _status_for_apply(moved: int, failed: int) -> str:
     if moved > 0:
         return "partial"
     return "failed"
+
+
+def _verify_item_for_apply(item: PlanItem) -> None:
+    """Turn a preview-ready item into an apply-verified item before mutation."""
+    if item.parsed is None or item.source_size is None or item.source_mtime_ns is None:
+        raise FilesystemSafetyError("planned item is missing source verification metadata")
+    if item.source_sha256 is not None:
+        return
+    if not is_ordinary_file(item.source):
+        raise FilesystemSafetyError(
+            f"source is no longer an ordinary file: {item.source}", error_type="source_missing"
+        )
+    try:
+        metadata = item.source.stat()
+    except OSError as exc:
+        raise FilesystemSafetyError(f"could not stat source {item.source}: {exc}") from exc
+    if metadata.st_size != item.source_size or metadata.st_mtime_ns != item.source_mtime_ns:
+        raise FilesystemSafetyError(
+            f"source changed after planning: {item.source}", error_type="source_changed"
+        )
+    item.source_sha256 = sha256_file(item.source)
 
 
 def _log_operation(
@@ -547,11 +581,9 @@ def apply_notes(
         prepared_operation_id: int | None = None
         operation_error_type: str | None = None
         try:
-            if (
-                item.parsed is None or item.source_size is None or item.source_mtime_ns is None
-                or item.source_sha256 is None
-            ):
-                raise FilesystemSafetyError("planned item is missing source verification data")
+            _verify_item_for_apply(item)
+            if item.source_sha256 is None:
+                raise FilesystemSafetyError("planned item is missing source SHA-256")
             snapshot_matches(item.source, item.source_size, item.source_mtime_ns, item.source_sha256)
             destination, just_created = _ensure_destination_directories(item.parsed, config)
             created_directories.extend(just_created)

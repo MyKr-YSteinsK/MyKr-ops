@@ -82,10 +82,20 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def names_equal(left: str, right: str) -> bool:
+    """Compare one filename component using the host filesystem's safe rule."""
+    if os.name != "nt":
+        return left.casefold() == right.casefold()
+    result = _compare_string_ordinal(left, len(left), right, len(right), True)
+    if result == 0:
+        _raise_windows_error("could not compare Windows filenames")
+    return result == _CSTR_EQUAL
+
+
 def direct_casefold_matches(parent: Path, name: str) -> list[Path]:
     assert_ordinary_directory(parent, f"directory {parent}")
     try:
-        return [child for child in parent.iterdir() if child.name.casefold() == name.casefold()]
+        return [child for child in parent.iterdir() if names_equal(child.name, name)]
     except OSError as exc:
         raise FilesystemSafetyError(f"could not inspect directory {parent}: {exc}") from exc
 
@@ -243,6 +253,7 @@ if os.name == "nt":
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_TYPE_DISK = 0x0001
     _FILE_RENAME_INFO_CLASS = 3
+    _CSTR_EQUAL = 2
     _ERROR_FILE_EXISTS = 80
     _ERROR_ALREADY_EXISTS = 183
     _ERROR_NOT_SAME_DEVICE = 17
@@ -306,6 +317,11 @@ if os.name == "nt":
     _set_file_information = _kernel32.SetFileInformationByHandle
     _set_file_information.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
     _set_file_information.restype = wintypes.BOOL
+    _compare_string_ordinal = _kernel32.CompareStringOrdinal
+    _compare_string_ordinal.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.LPCWSTR, ctypes.c_int, wintypes.BOOL,
+    ]
+    _compare_string_ordinal.restype = ctypes.c_int
 
 
 def _move_file_windows(
