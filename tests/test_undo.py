@@ -103,6 +103,31 @@ def test_undo_preserves_preexisting_and_nonempty_directories(tmp_path: Path) -> 
     assert not destination.exists()
 
 
+def test_undo_never_removes_a_recorded_directory_outside_the_study_root(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    database = database_for(tmp_path)
+    apply_one(config, database)
+    apply_run = database.latest_eligible_apply_run()
+    assert apply_run is not None
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    database.record_operation(
+        run_id=int(apply_run["id"]),
+        sequence_index=99,
+        action="mkdir",
+        status="success",
+        source_path=tmp_path,
+        destination_path=outside,
+        directory_name="outside",
+    )
+
+    result = notes.undo_latest(config, database)
+
+    assert result.moved_count == 1
+    assert result.failed_count == 1
+    assert outside.is_dir()
+
+
 def test_undo_reports_no_eligible_run(tmp_path: Path) -> None:
     config = make_config(tmp_path)
 

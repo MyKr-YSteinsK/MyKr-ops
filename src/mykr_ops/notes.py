@@ -9,6 +9,7 @@ from typing import Iterable
 from .database import Database, DatabaseSchemaError, MutationLockError
 from .filesystem import (
     FilesystemSafetyError,
+    VerifiedDirectoryRoot,
     assert_ordinary_directory,
     assert_within,
     create_child_directory,
@@ -17,11 +18,13 @@ from .filesystem import (
     is_reparse_point,
     move_file_without_overwrite,
     names_equal,
+    open_verified_directory_root,
     path_exists_no_follow,
     remove_empty_directory,
     resolve_child_directory,
     sha256_file,
     snapshot_matches,
+    verify_child_directory,
 )
 from .models import (
     NotesConfig,
@@ -45,6 +48,8 @@ RESERVED_WINDOWS_NAMES = {
     "NUL",
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
+    *(f"COM{suffix}" for suffix in ("¹", "²", "³", "鹿", "虏", "鲁")),
+    *(f"LPT{suffix}" for suffix in ("¹", "²", "³", "鹿", "虏", "鲁")),
 }
 ERROR_TYPES = frozenset({
     "source_changed",
@@ -343,15 +348,39 @@ def _record_item(
 
 
 def _ensure_destination_directories(
-    parsed: ParsedNote, config: NotesConfig
+    parsed: ParsedNote,
+    config: NotesConfig,
+    database: Database,
+    run_id: int,
+    sequence_index: int,
+    verified_root: VerifiedDirectoryRoot | None,
+    logger: logging.Logger | None,
 ) -> tuple[Path, list[Path]]:
     root = config.study_root
     created: list[Path] = []
     try:
-        first_level, first_created = create_child_directory(root, parsed.first_level, root)
+        first_level, first_created = _create_recorded_child_directory(
+            root,
+            parsed.first_level,
+            root,
+            database,
+            run_id,
+            sequence_index,
+            verified_root,
+            logger,
+        )
         if first_created:
             created.append(first_level)
-        course, course_created = create_child_directory(first_level, parsed.course, root)
+        course, course_created = _create_recorded_child_directory(
+            first_level,
+            parsed.course,
+            root,
+            database,
+            run_id,
+            sequence_index,
+            verified_root,
+            logger,
+        )
         if course_created:
             created.append(course)
     except FilesystemSafetyError as exc:
@@ -359,6 +388,56 @@ def _ensure_destination_directories(
             raise DirectoryCreationError(str(exc), created) from exc
         raise
     return course / parsed.target_name, created
+
+
+def _create_recorded_child_directory(
+    parent: Path,
+    name: str,
+    root: Path,
+    database: Database,
+    run_id: int,
+    sequence_index: int,
+    verified_root: VerifiedDirectoryRoot | None,
+    logger: logging.Logger | None,
+) -> tuple[Path, bool]:
+    child, needs_creation = resolve_child_directory(parent, name, root)
+    if not needs_creation:
+        return create_child_directory(parent, name, root, verified_root=verified_root)
+
+    operation_id = database.prepare_operation(
+        run_id=run_id,
+        sequence_index=sequence_index,
+        action="mkdir",
+        source_path=parent,
+        destination_path=child,
+        directory_name=name,
+    )
+    _log_operation(
+        logger,
+        level=logging.INFO,
+        run_id=run_id,
+        action="mkdir",
+        status="prepared",
+        source=parent,
+        destination=child,
+    )
+    actual_child, created = create_child_directory(parent, name, root, verified_root=verified_root)
+    if created:
+        database.update_operation_status(operation_id, "success")
+        _log_operation(
+            logger,
+            level=logging.INFO,
+            run_id=run_id,
+            action="mkdir",
+            status="success",
+            source=parent,
+            destination=actual_child,
+        )
+    else:
+        database.update_operation_status(
+            operation_id, "skipped", "directory appeared concurrently and was not created by this run"
+        )
+    return actual_child, created
 
 
 def _target_is_absent(destination: Path) -> None:
@@ -468,6 +547,29 @@ def _classify_prepared_operation(operation: object, config: NotesConfig) -> tupl
     )
 
 
+def _classify_prepared_directory(operation: object, config: NotesConfig) -> tuple[str, str, str | None]:
+    """Reconcile a directory intent without creating, removing, or moving anything."""
+    try:
+        parent_value = operation["source_path"]
+        destination_value = operation["destination_path"]
+        name = operation["directory_name"]
+        if not parent_value or not destination_value or not name:
+            raise FilesystemSafetyError("directory intent is missing its expected parent, path, or name")
+        parent = Path(parent_value)
+        destination = Path(destination_value)
+        if not names_equal(destination.name, str(name)):
+            raise FilesystemSafetyError("directory intent name does not match its destination path")
+        assert_within(parent, config.study_root)
+        assert_within(destination, config.study_root)
+        if not path_exists_no_follow(destination):
+            return "failed", "recovery confirmed that the directory was not created", "unknown_filesystem_error"
+        with open_verified_directory_root(config.study_root, "study root") as root:
+            verify_child_directory(destination, parent, str(name), root)
+        return "success", "recovery confirmed that the directory was created", None
+    except (FilesystemSafetyError, OSError, TypeError) as exc:
+        return "recovery_required", f"directory state cannot be inspected safely: {exc}", "recovery_ambiguous"
+
+
 def _finalize_recovered_runs(database: Database, recovered_run_ids: set[int]) -> None:
     runs_by_id = {int(run["id"]): run for run in database.running_runs()}
     for run_id in recovered_run_ids:
@@ -515,7 +617,10 @@ def recover_interrupted_operations(
     database.initialize()
     recovered_run_ids: set[int] = set()
     for operation in database.prepared_or_recovery_operations():
-        status, reason, error_type = _classify_prepared_operation(operation, config)
+        if operation["action"] == "mkdir":
+            status, reason, error_type = _classify_prepared_directory(operation, config)
+        else:
+            status, reason, error_type = _classify_prepared_operation(operation, config)
         if operation["action"] == "undo_move" and status == "success":
             database.finalize_undo_operation(
                 int(operation["id"]), int(operation["related_operation_id"]), int(operation["run_id"])
@@ -564,6 +669,16 @@ def apply_notes(
             return apply_notes(config, database, logger, lock_held=True)
 
     recover_interrupted_operations(config, database, logger)
+    with open_verified_directory_root(config.study_root, "study root") as destination_root:
+        return _apply_notes_with_root(config, database, logger, destination_root)
+
+
+def _apply_notes_with_root(
+    config: NotesConfig,
+    database: Database,
+    logger: logging.Logger | None,
+    destination_root: VerifiedDirectoryRoot | None,
+) -> RunResult:
     plan = plan_notes(config)
     run_id = database.create_run("notes", "apply", matched_count=plan.matched_count)
     created_directories: list[Path] = []
@@ -586,17 +701,16 @@ def apply_notes(
             if item.source_sha256 is None:
                 raise FilesystemSafetyError("planned item is missing source SHA-256")
             snapshot_matches(item.source, item.source_size, item.source_mtime_ns, item.source_sha256)
-            destination, just_created = _ensure_destination_directories(item.parsed, config)
+            destination, just_created = _ensure_destination_directories(
+                item.parsed,
+                config,
+                database,
+                run_id,
+                sequence_index,
+                destination_root,
+                logger,
+            )
             created_directories.extend(just_created)
-            for directory in just_created:
-                database.record_operation(
-                    run_id=run_id, sequence_index=sequence_index, action="mkdir", status="success",
-                    destination_path=directory,
-                )
-                _log_operation(
-                    logger, level=logging.INFO, run_id=run_id, action="mkdir", status="success",
-                    source=None, destination=directory,
-                )
             assert_within(destination, config.study_root)
             _target_is_absent(destination)
             snapshot_matches(item.source, item.source_size, item.source_mtime_ns, item.source_sha256)
@@ -620,6 +734,7 @@ def apply_notes(
                 item.source_sha256,
                 expected_size=item.source_size,
                 expected_mtime_ns=item.source_mtime_ns,
+                destination_root=destination_root,
             )
             assert_within(destination, config.study_root)
             database.update_operation_status(prepared_operation_id, "success")
@@ -632,12 +747,7 @@ def apply_notes(
         except (FilesystemSafetyError, OSError) as exc:
             operation_error_type = _error_type_for_exception(exc)
             if isinstance(exc, DirectoryCreationError):
-                for directory in exc.created_directories:
-                    created_directories.append(directory)
-                    database.record_operation(
-                        run_id=run_id, sequence_index=sequence_index, action="mkdir", status="success",
-                        destination_path=directory,
-                    )
+                created_directories.extend(exc.created_directories)
             if prepared_operation_id is not None:
                 prepared = next(
                     operation for operation in database.operations_for_run(run_id)
@@ -686,7 +796,7 @@ def apply_notes(
     else:
         for directory in sorted(set(created_directories), key=lambda path: len(path.parts), reverse=True):
             try:
-                remove_empty_directory(directory, config.study_root)
+                remove_empty_directory(directory, config.study_root, verified_root=destination_root)
             except FilesystemSafetyError:
                 pass
 
@@ -755,6 +865,23 @@ def undo_latest(
         return UndoResult(None, None, [], 0, 0, 0, "No eligible apply run to undo.")
 
     _validate_roots(config)
+    with (
+        open_verified_directory_root(config.study_root, "study root") as source_root,
+        open_verified_directory_root(config.source_dir, "source directory") as destination_root,
+    ):
+        return _undo_latest_with_roots(
+            config, database, logger, apply_run, source_root, destination_root
+        )
+
+
+def _undo_latest_with_roots(
+    config: NotesConfig,
+    database: Database,
+    logger: logging.Logger | None,
+    apply_run: object,
+    source_root: VerifiedDirectoryRoot | None,
+    destination_root: VerifiedDirectoryRoot | None,
+) -> UndoResult:
     apply_run_id = int(apply_run["id"])
     successful_moves = database.successful_moves_for_run(apply_run_id)
     run_id = database.create_run("undo", "undo", matched_count=len(successful_moves))
@@ -783,7 +910,13 @@ def undo_latest(
                 logger, level=logging.INFO, run_id=run_id, action="undo_move", status="prepared",
                 source=destination, destination=source,
             )
-            move_file_without_overwrite(destination, source, expected_sha256)
+            move_file_without_overwrite(
+                destination,
+                source,
+                expected_sha256,
+                destination_root=destination_root,
+                source_root=source_root,
+            )
             assert_within(source, config.source_dir)
             database.finalize_undo_operation(prepared_operation_id, int(operation["id"]), run_id)
             results.append(UndoItem(destination, source, "success"))
@@ -838,12 +971,21 @@ def undo_latest(
                 break
 
     removed_dir_count = 0
+    directory_failed_count = 0
     if recovery_operation_id is None:
         for sequence_index, operation in enumerate(database.created_directories_for_run(apply_run_id), start=1):
             directory = Path(operation["destination_path"])
+            parent = Path(operation["source_path"])
+            directory_name = str(operation["directory_name"])
             error_type: str | None = None
             try:
-                removed = remove_empty_directory(directory, config.study_root)
+                removed = remove_empty_directory(
+                    directory,
+                    config.study_root,
+                    verified_root=source_root,
+                    expected_parent=parent,
+                    expected_name=directory_name,
+                )
                 status = "success" if removed else "skipped"
                 reason = None if removed else "directory is absent or not empty"
                 removed_dir_count += int(removed)
@@ -851,6 +993,7 @@ def undo_latest(
                 status = "failed"
                 reason = str(exc)
                 error_type = _error_type_for_exception(exc)
+                directory_failed_count += 1
             database.record_operation(
                 run_id=run_id,
                 sequence_index=sequence_index,
@@ -874,7 +1017,7 @@ def undo_latest(
             )
 
     moved_count = sum(item.status == "success" for item in results)
-    failed_count = sum(item.status == "failed" for item in results)
+    failed_count = sum(item.status == "failed" for item in results) + directory_failed_count
     status = _status_for_apply(moved_count, failed_count)
     summary = (
         f"apply_run={apply_run_id}; restored={moved_count}; failed={failed_count}; "

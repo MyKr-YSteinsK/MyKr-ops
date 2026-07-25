@@ -99,9 +99,9 @@ def test_apply_rejects_source_changed_after_deferred_preview(
     source = write_source(config, "before")
     actual_ensure = notes._ensure_destination_directories
 
-    def change_source(parsed: object, current_config: NotesConfig) -> tuple[Path, list[Path]]:
+    def change_source(*args: object, **kwargs: object) -> tuple[Path, list[Path]]:
         source.write_text("after", encoding="utf-8")
-        return actual_ensure(parsed, current_config)  # type: ignore[arg-type]
+        return actual_ensure(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(notes, "_ensure_destination_directories", change_source)
     result = notes.apply_notes(config, Database(tmp_path / "state" / "mykr-ops.db"))

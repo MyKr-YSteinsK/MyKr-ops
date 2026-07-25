@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sqlite3
 from pathlib import Path
 
@@ -65,6 +66,7 @@ def test_prepared_insert_failure_does_not_move_file(tmp_path: Path, monkeypatch:
 
     assert source.read_text(encoding="utf-8") == "note"
     assert not (config.study_root / "CS" / "Course" / "01-Topic.md").exists()
+    assert not (config.study_root / "CS").exists()
 
 
 def test_apply_success_update_failure_is_recovered_and_can_be_undone(
@@ -77,7 +79,13 @@ def test_apply_success_update_failure_is_recovered_and_can_be_undone(
     original_update = database.update_operation_status
 
     def fail_success(operation_id: int, status: str, reason: str | None = None) -> None:
-        if status == "success":
+        recorded = next(
+            row
+            for run in database.list_runs()
+            for row in database.operations_for_run(int(run["id"]))
+            if int(row["id"]) == operation_id
+        )
+        if status == "success" and recorded["action"] == "move":
             raise sqlite3.OperationalError("final update failed")
         original_update(operation_id, status, reason)
 
@@ -222,6 +230,170 @@ def test_manually_resolved_recovery_required_operation_is_reconciled_again(tmp_p
 
     assert operation(database, run_id)["status"] == "failed"
     assert database.get_run(run_id)["status"] == "failed"
+
+
+def test_directory_intent_is_prepared_before_creation_and_finalized_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    source = config.source_dir / "01-Topic_CS_Course.md"
+    source.write_text("note", encoding="utf-8")
+    database = database_for(tmp_path)
+    actual_create = notes.create_child_directory
+    observed_prepared = False
+
+    def observe_prepare(*args: object, **kwargs: object) -> tuple[Path, bool]:
+        nonlocal observed_prepared
+        observed_prepared = any(
+            row["action"] == "mkdir" and row["status"] == "prepared"
+            for run in database.list_runs()
+            for row in database.operations_for_run(int(run["id"]))
+        )
+        return actual_create(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(notes, "create_child_directory", observe_prepare)
+    result = notes.apply_notes(config, database)
+
+    mkdir_operations = [
+        row for row in database.operations_for_run(result.run_id or 0) if row["action"] == "mkdir"
+    ]
+    assert observed_prepared
+    assert [row["status"] for row in mkdir_operations] == ["success", "success"]
+    assert [row["directory_name"] for row in mkdir_operations] == ["CS", "Course"]
+    assert mkdir_operations[0]["source_path"] == str(config.study_root)
+    assert mkdir_operations[1]["source_path"] == str(config.study_root / "CS")
+
+
+def test_interrupted_directory_creation_recovers_exact_safe_directory_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    source = config.source_dir / "01-Topic_CS_Course.md"
+    source.write_text("note", encoding="utf-8")
+    database = database_for(tmp_path)
+    original_update = database.update_operation_status
+
+    def fail_directory_success(operation_id: int, status: str, reason: str | None = None) -> None:
+        recorded = next(
+            row
+            for run in database.list_runs()
+            for row in database.operations_for_run(int(run["id"]))
+            if int(row["id"]) == operation_id
+        )
+        if recorded["action"] == "mkdir" and status == "success":
+            raise sqlite3.OperationalError("directory status update failed")
+        original_update(operation_id, status, reason)
+
+    monkeypatch.setattr(database, "update_operation_status", fail_directory_success)
+    with pytest.raises(sqlite3.OperationalError):
+        notes.apply_notes(config, database)
+    monkeypatch.setattr(database, "update_operation_status", original_update)
+
+    run_id = int(database.list_runs()[0]["id"])
+    directory_operation = next(
+        row for row in database.operations_for_run(run_id) if row["action"] == "mkdir"
+    )
+    assert directory_operation["status"] == "prepared"
+    assert (config.study_root / "CS").is_dir()
+    assert not (config.study_root / "CS" / "Course").exists()
+
+    with database.mutation_lock():
+        notes.recover_interrupted_operations(config, database)
+
+    directory_operation = next(
+        row for row in database.operations_for_run(run_id) if row["action"] == "mkdir"
+    )
+    assert directory_operation["status"] == "success"
+
+
+def test_absent_prepared_directory_recovers_as_failed_without_creating_it(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    database = database_for(tmp_path)
+    run_id = database.create_run("notes", "apply", matched_count=1)
+    database.prepare_operation(
+        run_id=run_id,
+        sequence_index=1,
+        action="mkdir",
+        source_path=config.study_root,
+        destination_path=config.study_root / "CS",
+        directory_name="CS",
+    )
+
+    with database.mutation_lock():
+        notes.recover_interrupted_operations(config, database)
+
+    directory_operation = next(
+        row for row in database.operations_for_run(run_id) if row["action"] == "mkdir"
+    )
+    assert directory_operation["status"] == "failed"
+    assert not (config.study_root / "CS").exists()
+
+
+@pytest.mark.parametrize("state", ["file", "wrong_parent"])
+def test_ambiguous_prepared_directory_requires_manual_recovery_without_changes(
+    tmp_path: Path, state: str
+) -> None:
+    config = make_config(tmp_path)
+    database = database_for(tmp_path)
+    destination = config.study_root / "CS"
+    if state == "file":
+        destination.write_text("user file", encoding="utf-8")
+        parent = config.study_root
+    else:
+        destination.mkdir()
+        parent = config.study_root / "Other"
+    run_id = database.create_run("notes", "apply", matched_count=1)
+    database.prepare_operation(
+        run_id=run_id,
+        sequence_index=1,
+        action="mkdir",
+        source_path=parent,
+        destination_path=destination,
+        directory_name="CS",
+    )
+
+    with database.mutation_lock(), pytest.raises(notes.RecoveryRequiredError):
+        notes.recover_interrupted_operations(config, database)
+
+    directory_operation = next(
+        row for row in database.operations_for_run(run_id) if row["action"] == "mkdir"
+    )
+    assert directory_operation["status"] == "recovery_required"
+    if state == "file":
+        assert destination.read_text(encoding="utf-8") == "user file"
+    else:
+        assert destination.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point integration")
+def test_reparse_prepared_directory_requires_manual_recovery_without_changes(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    database = database_for(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = config.study_root / "CS"
+    try:
+        destination.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"creating a directory symlink is unavailable: {exc}")
+    run_id = database.create_run("notes", "apply", matched_count=1)
+    database.prepare_operation(
+        run_id=run_id,
+        sequence_index=1,
+        action="mkdir",
+        source_path=config.study_root,
+        destination_path=destination,
+        directory_name="CS",
+    )
+
+    with database.mutation_lock(), pytest.raises(notes.RecoveryRequiredError):
+        notes.recover_interrupted_operations(config, database)
+
+    directory_operation = next(
+        row for row in database.operations_for_run(run_id) if row["action"] == "mkdir"
+    )
+    assert directory_operation["status"] == "recovery_required"
+    assert destination.is_symlink()
 
 
 def test_apply_stops_immediately_when_current_prepared_operation_requires_recovery(

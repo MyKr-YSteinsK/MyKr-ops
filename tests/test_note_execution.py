@@ -94,9 +94,9 @@ def test_apply_rejects_source_changed_after_planning(tmp_path: Path, monkeypatch
     source = write_note(config, "01-Topic_CS_Course.md", "before")
     actual_ensure = notes._ensure_destination_directories
 
-    def change_source(parsed: object, current_config: NotesConfig) -> tuple[Path, list[Path]]:
+    def change_source(*args: object, **kwargs: object) -> tuple[Path, list[Path]]:
         source.write_text("after", encoding="utf-8")
-        return actual_ensure(parsed, current_config)  # type: ignore[arg-type]
+        return actual_ensure(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(notes, "_ensure_destination_directories", change_source)
     result = notes.apply_notes(config, database_for(tmp_path))
@@ -155,12 +155,14 @@ def test_apply_removes_first_level_created_before_course_creation_fails(
     actual_create = notes.create_child_directory
     call_count = 0
 
-    def fail_course_creation(parent: Path, name: str, root: Path) -> tuple[Path, bool]:
+    def fail_course_creation(
+        parent: Path, name: str, root: Path, **kwargs: object
+    ) -> tuple[Path, bool]:
         nonlocal call_count
         call_count += 1
         if call_count == 2:
             raise notes.FilesystemSafetyError("course directory is locked")
-        return actual_create(parent, name, root)
+        return actual_create(parent, name, root, **kwargs)
 
     monkeypatch.setattr(notes, "create_child_directory", fail_course_creation)
     result = notes.apply_notes(config, database_for(tmp_path))

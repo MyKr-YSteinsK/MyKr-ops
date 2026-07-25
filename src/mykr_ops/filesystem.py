@@ -4,7 +4,10 @@ import ctypes
 import hashlib
 import os
 import stat
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -16,6 +19,16 @@ class FilesystemSafetyError(RuntimeError):
     def __init__(self, message: str, *, error_type: str | None = None) -> None:
         super().__init__(message)
         self.error_type = error_type
+
+
+@dataclass(frozen=True)
+class VerifiedDirectoryRoot:
+    """A fixed root directory object retained for one mutation critical section."""
+
+    path: Path
+    handle: int
+    identity: tuple[int, int, int, int, int]
+    final_path: str
 
 
 def path_exists_no_follow(path: Path) -> bool:
@@ -125,36 +138,71 @@ def resolve_child_directory(parent: Path, name: str, root: Path) -> tuple[Path, 
     return candidate, True
 
 
-def create_child_directory(parent: Path, name: str, root: Path) -> tuple[Path, bool]:
+def create_child_directory(
+    parent: Path,
+    name: str,
+    root: Path,
+    *,
+    verified_root: VerifiedDirectoryRoot | None = None,
+) -> tuple[Path, bool]:
     """Create one validated direct child directory without following links."""
-    child, needs_creation = resolve_child_directory(parent, name, root)
-    if not needs_creation:
-        return child, False
+    parent_handle = (
+        _open_verified_directory_under_root(verified_root, parent, f"directory {parent}")
+        if verified_root is not None
+        else None
+    )
     try:
-        child.mkdir()
-    except FileExistsError:
-        # A concurrent actor created something. Reinspect it rather than trusting it.
-        return resolve_child_directory(parent, name, root)[0], False
-    except OSError as exc:
-        raise FilesystemSafetyError(f"could not create directory {child}: {exc}") from exc
-    if not is_ordinary_directory(child):
-        raise FilesystemSafetyError(f"new directory is not safe to use: {child}")
-    assert_within(child, root)
-    return child, True
+        child, needs_creation = resolve_child_directory(parent, name, root)
+        if not needs_creation:
+            _verify_child_directory(child, parent, name, verified_root)
+            return child, False
+        try:
+            child.mkdir()
+        except FileExistsError:
+            # A concurrent actor created something. Reinspect it rather than trusting it.
+            existing, _ = resolve_child_directory(parent, name, root)
+            _verify_child_directory(existing, parent, name, verified_root)
+            return existing, False
+        except OSError as exc:
+            raise FilesystemSafetyError(f"could not create directory {child}: {exc}") from exc
+        _verify_child_directory(child, parent, name, verified_root)
+        return child, True
+    finally:
+        if parent_handle is not None:
+            _close_handle(parent_handle)
 
 
-def remove_empty_directory(path: Path, root: Path) -> bool:
+def remove_empty_directory(
+    path: Path,
+    root: Path,
+    *,
+    verified_root: VerifiedDirectoryRoot | None = None,
+    expected_parent: Path | None = None,
+    expected_name: str | None = None,
+) -> bool:
     """Remove only an ordinary, empty directory known to be inside its root."""
     assert_within(path, root)
-    if not path_exists_no_follow(path):
-        return False
-    if not is_ordinary_directory(path):
-        raise FilesystemSafetyError(f"directory is no longer safe to remove: {path}")
+    parent = path.parent if expected_parent is None else expected_parent
+    name = path.name if expected_name is None else expected_name
+    parent_handle = (
+        _open_verified_directory_under_root(verified_root, parent, f"directory {parent}")
+        if verified_root is not None
+        else None
+    )
     try:
-        path.rmdir()
-    except OSError:
-        return False
-    return True
+        if not path_exists_no_follow(path):
+            return False
+        if not is_ordinary_directory(path):
+            raise FilesystemSafetyError(f"directory is no longer safe to remove: {path}")
+        _verify_child_directory(path, parent, name, verified_root)
+        try:
+            path.rmdir()
+        except OSError:
+            return False
+        return True
+    finally:
+        if parent_handle is not None:
+            _close_handle(parent_handle)
 
 
 def snapshot_matches(path: Path, expected_size: int, expected_mtime_ns: int, expected_sha256: str) -> None:
@@ -181,6 +229,8 @@ def move_file_without_overwrite(
     *,
     expected_size: int | None = None,
     expected_mtime_ns: int | None = None,
+    destination_root: VerifiedDirectoryRoot | None = None,
+    source_root: VerifiedDirectoryRoot | None = None,
 ) -> None:
     """Move one file atomically without replacing an existing destination.
 
@@ -205,7 +255,13 @@ def move_file_without_overwrite(
 
     if os.name == "nt":
         _move_file_windows(
-            source, destination, expected_sha256, source_size, source_mtime_ns
+            source,
+            destination,
+            expected_sha256,
+            source_size,
+            source_mtime_ns,
+            destination_root,
+            source_root,
         )
         return
     _move_file_portably(source, destination, expected_sha256, source_size, source_mtime_ns)
@@ -259,6 +315,7 @@ if os.name == "nt":
     _FILE_TYPE_DISK = 0x0001
     _FILE_ATTRIBUTE_DIRECTORY = 0x0010
     _FILE_RENAME_INFORMATION_CLASS = 10
+    _VOLUME_NAME_GUID = 0x00000001
     _CSTR_EQUAL = 2
     _ERROR_FILE_EXISTS = 80
     _ERROR_ALREADY_EXISTS = 183
@@ -323,6 +380,11 @@ if os.name == "nt":
         wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD,
     ]
     _set_file_pointer.restype = wintypes.BOOL
+    _get_final_path_name_by_handle = _kernel32.GetFinalPathNameByHandleW
+    _get_final_path_name_by_handle.argtypes = [
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    ]
+    _get_final_path_name_by_handle.restype = wintypes.DWORD
     _compare_string_ordinal = _kernel32.CompareStringOrdinal
     _compare_string_ordinal.argtypes = [
         wintypes.LPCWSTR, ctypes.c_int, wintypes.LPCWSTR, ctypes.c_int, wintypes.BOOL,
@@ -353,11 +415,21 @@ def _move_file_windows(
     expected_sha256: str,
     expected_size: int,
     expected_mtime_ns: int,
+    destination_root: VerifiedDirectoryRoot | None,
+    source_root: VerifiedDirectoryRoot | None,
 ) -> None:
     source_handle = _open_source_handle(source)
-    destination_parent_handle = _open_directory_handle(destination.parent)
+    destination_parent_handle = (
+        _open_verified_directory_under_root(
+            destination_root, destination.parent, f"destination directory {destination.parent}"
+        )
+        if destination_root is not None
+        else _open_directory_handle(destination.parent)
+    )
     try:
         source_identity = _handle_identity(source_handle, f"source {source}")
+        if source_root is not None:
+            _validate_open_handle_under_root(source_handle, source_root, f"source {source}")
         parent_identity = _handle_identity(
             destination_parent_handle, f"destination directory {destination.parent}"
         )
@@ -457,6 +529,131 @@ def _open_directory_handle(path: Path) -> int:
     return handle
 
 
+@contextmanager
+def open_verified_directory_root(path: Path, description: str) -> Iterator[VerifiedDirectoryRoot | None]:
+    """Retain one verified directory object while a mutation uses its descendants."""
+    assert_ordinary_directory(path, description)
+    if os.name != "nt":
+        yield None
+        return
+    handle = _open_directory_handle(path)
+    try:
+        identity = _handle_identity(handle, description)
+        yield VerifiedDirectoryRoot(path, handle, identity, _final_path_from_handle(handle, description))
+    finally:
+        _close_handle(handle)
+
+
+def _normalize_final_path(value: str) -> str:
+    """Normalize documented GetFinalPathNameByHandleW path prefixes for comparison."""
+    normalized = value.replace("/", "\\")
+    if normalized.casefold().startswith("\\\\?\\unc\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.casefold().startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return normalized.rstrip("\\")
+
+
+def _final_path_parts(value: str) -> tuple[str, ...]:
+    return tuple(part for part in _normalize_final_path(value).split("\\") if part)
+
+
+def _final_path_is_descendant(value: str, root: str) -> bool:
+    value_parts = _final_path_parts(value)
+    root_parts = _final_path_parts(root)
+    return len(value_parts) >= len(root_parts) and all(
+        names_equal(value_part, root_part) for value_part, root_part in zip(value_parts, root_parts)
+    )
+
+
+def _final_path_is_direct_child(value: str, parent: str, name: str) -> bool:
+    value_parts = _final_path_parts(value)
+    parent_parts = _final_path_parts(parent)
+    return (
+        len(value_parts) == len(parent_parts) + 1
+        and all(names_equal(value_part, parent_part) for value_part, parent_part in zip(value_parts, parent_parts))
+        and names_equal(value_parts[-1], name)
+    )
+
+
+def _final_path_from_handle(handle: int, description: str) -> str:
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = _get_final_path_name_by_handle(handle, buffer, len(buffer), _VOLUME_NAME_GUID)
+    if length == 0:
+        _raise_windows_error(f"could not resolve final path for {description}")
+    if length >= len(buffer):
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        length = _get_final_path_name_by_handle(handle, buffer, len(buffer), _VOLUME_NAME_GUID)
+        if length == 0 or length >= len(buffer):
+            _raise_windows_error(f"could not resolve final path for {description}")
+    return _normalize_final_path(buffer.value)
+
+
+def _validate_open_handle_under_root(
+    handle: int, root: VerifiedDirectoryRoot, description: str
+) -> tuple[int, int, int, int, int]:
+    identity = _handle_identity(handle, description)
+    if identity[0] != root.identity[0]:
+        raise FilesystemSafetyError(
+            f"{description} is on a different volume from verified root {root.path}",
+            error_type="cross_volume",
+        )
+    if not _final_path_is_descendant(_final_path_from_handle(handle, description), root.final_path):
+        raise FilesystemSafetyError(
+            f"{description} escapes verified root {root.path}", error_type="path_escape"
+        )
+    return identity
+
+
+def _open_verified_directory_under_root(
+    root: VerifiedDirectoryRoot, path: Path, description: str
+) -> int:
+    handle = _open_directory_handle(path)
+    try:
+        _validate_open_handle_under_root(handle, root, description)
+        return handle
+    except BaseException:
+        _close_handle(handle)
+        raise
+
+
+def _verify_child_directory(
+    child: Path,
+    parent: Path,
+    expected_name: str,
+    verified_root: VerifiedDirectoryRoot | None,
+) -> None:
+    if not is_ordinary_directory(child):
+        raise FilesystemSafetyError(f"new directory is not safe to use: {child}")
+    if verified_root is None:
+        return
+    child_handle = _open_verified_directory_under_root(verified_root, child, f"directory {child}")
+    parent_handle = _open_verified_directory_under_root(verified_root, parent, f"directory {parent}")
+    try:
+        if not _final_path_is_direct_child(
+            _final_path_from_handle(child_handle, f"directory {child}"),
+            _final_path_from_handle(parent_handle, f"directory {parent}"),
+            expected_name,
+        ):
+            raise FilesystemSafetyError(
+                f"directory is not the expected direct child of its verified parent: {child}",
+                error_type="path_escape",
+            )
+    finally:
+        _close_handle(parent_handle)
+        _close_handle(child_handle)
+
+
+def verify_child_directory(
+    child: Path,
+    parent: Path,
+    expected_name: str,
+    verified_root: VerifiedDirectoryRoot | None = None,
+) -> None:
+    """Validate an existing direct-child directory without creating anything."""
+    _verify_child_directory(child, parent, expected_name, verified_root)
+
+
 def _handle_identity(handle: int, description: str) -> tuple[int, int, int, int, int]:
     information = _ByHandleFileInformation()
     if not _get_file_information(handle, ctypes.byref(information)):
@@ -503,7 +700,11 @@ def _rename_handle_without_overwrite(source_handle: int, parent_handle: int, des
         )
 
     encoded_name = relative_name.encode("utf-16-le")
-    buffer_size = _FileRenameInformation.FileName.offset + len(encoded_name)
+    # Keep at least the complete fixed structure even for unusually short names.
+    buffer_size = max(
+        ctypes.sizeof(_FileRenameInformation),
+        _FileRenameInformation.FileName.offset + len(encoded_name),
+    )
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(_FileRenameInformation)).contents
     rename_info.ReplaceIfExists = False

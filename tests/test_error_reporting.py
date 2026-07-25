@@ -112,9 +112,9 @@ def test_windows_locked_source_is_recorded_with_error_type(tmp_path: Path, monke
     actual_ensure = notes._ensure_destination_directories
     held_handle: int | None = None
 
-    def lock_source(parsed: object, current_config: NotesConfig) -> tuple[Path, list[Path]]:
+    def lock_source(*args: object, **kwargs: object) -> tuple[Path, list[Path]]:
         nonlocal held_handle
-        destination, created = actual_ensure(parsed, current_config)  # type: ignore[arg-type]
+        destination, created = actual_ensure(*args, **kwargs)  # type: ignore[arg-type]
         held_handle = filesystem._create_file(
             str(source), filesystem._GENERIC_READ, 0, None, filesystem._OPEN_EXISTING, 0, None
         )

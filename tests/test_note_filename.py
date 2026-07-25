@@ -34,6 +34,14 @@ def test_preserves_underscores_in_topic() -> None:
         ("01-Top:ic_CS_Course.md", "invalid Windows"),
         ("01-Topic_CON_Course.md", "reserved"),
         ("01-Topic_CS_CON.txt.md", "reserved"),
+        ("01-Topic_COM鹿_Course.md", "reserved"),
+        ("01-Topic_COM虏_Course.md", "reserved"),
+        ("01-Topic_COM鲁_Course.md", "reserved"),
+        ("01-Topic_CS_LPT鹿.md", "reserved"),
+        ("01-Topic_CS_LPT虏.txt.md", "reserved"),
+        ("01-Topic_CS_LPT鲁.md", "reserved"),
+        ("01-Topic_COM¹_Course.md", "reserved"),
+        ("01-Topic_CS_LPT².md", "reserved"),
         ("01-Topic_ CS_Course.md", "whitespace"),
         ("01-Topic_CS_Course..md", "period"),
     ],
@@ -46,3 +54,10 @@ def test_rejects_invalid_note_filename(name: str, message: str) -> None:
 def test_directory_components_reject_underscores() -> None:
     with pytest.raises(FilenameError, match="underscore"):
         _validate_component("CS_notes", "first-level directory", allow_underscores=False)
+
+
+def test_unrelated_unicode_directory_components_remain_valid() -> None:
+    parsed = parse_note_filename("01-Topic_课程_猫咪.md")
+
+    assert parsed.first_level == "课程"
+    assert parsed.course == "猫咪"

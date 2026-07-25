@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OPERATION_STATUSES = (
     "prepared",
     "success",
@@ -107,6 +107,9 @@ class Database:
         if version == 1:
             self._migrate_phase2a_schema(connection)
             return
+        if version == 2:
+            self._migrate_phase2e_schema(connection)
+            return
         if version != SCHEMA_VERSION:
             raise DatabaseSchemaError(f"database schema version {version} is not recognized")
         self._validate_latest_schema(connection)
@@ -151,6 +154,7 @@ class Database:
                 file_size INTEGER,
                 source_mtime_ns INTEGER,
                 sha256 TEXT,
+                directory_name TEXT,
                 status TEXT NOT NULL CHECK (status IN ({status_values})),
                 reason TEXT,
                 error_type TEXT,
@@ -237,14 +241,36 @@ class Database:
         try:
             with connection:
                 connection.execute("ALTER TABLE operations ADD COLUMN error_type TEXT")
+                connection.execute("ALTER TABLE operations ADD COLUMN directory_name TEXT")
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.Error as exc:
             raise DatabaseSchemaError(f"could not migrate the Phase 2A database safely: {exc}") from exc
 
+    def _migrate_phase2e_schema(self, connection: sqlite3.Connection) -> None:
+        required_operations = {
+            "id", "run_id", "sequence_index", "action", "source_path", "destination_path",
+            "file_size", "source_mtime_ns", "sha256", "status", "reason", "error_type",
+            "related_operation_id", "undone_at", "undo_run_id", "created_at",
+        }
+        columns = self._columns(connection, "operations")
+        if not required_operations.issubset(columns) or "directory_name" in columns:
+            raise DatabaseSchemaError("existing version-2 database is not the expected Phase 2E schema")
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+        ).fetchone()["sql"].casefold()
+        if "prepared" not in definition or "recovery_required" not in definition:
+            raise DatabaseSchemaError("existing version-2 operation status schema is not recognized")
+        try:
+            with connection:
+                connection.execute("ALTER TABLE operations ADD COLUMN directory_name TEXT")
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except sqlite3.Error as exc:
+            raise DatabaseSchemaError(f"could not migrate the Phase 2E database safely: {exc}") from exc
+
     def _validate_latest_schema(self, connection: sqlite3.Connection) -> None:
         required_operations = {
             "id", "run_id", "sequence_index", "action", "source_path", "destination_path",
-            "file_size", "source_mtime_ns", "sha256", "status", "reason", "error_type", "related_operation_id",
+            "file_size", "source_mtime_ns", "sha256", "directory_name", "status", "reason", "error_type", "related_operation_id",
             "undone_at", "undo_run_id", "created_at",
         }
         if not required_operations.issubset(self._columns(connection, "operations")):
@@ -286,7 +312,7 @@ class Database:
     def record_operation(self, *, run_id: int, sequence_index: int, action: str, status: str,
                          source_path: Path | None = None, destination_path: Path | None = None,
                          file_size: int | None = None, source_mtime_ns: int | None = None,
-                         sha256: str | None = None, reason: str | None = None,
+                         sha256: str | None = None, directory_name: str | None = None, reason: str | None = None,
                          error_type: str | None = None,
                          related_operation_id: int | None = None) -> int:
         with self._connect() as connection:
@@ -294,13 +320,14 @@ class Database:
                 """
                 INSERT INTO operations (
                     run_id, sequence_index, action, source_path, destination_path, file_size,
-                    source_mtime_ns, sha256, status, reason, error_type, related_operation_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_mtime_ns, sha256, directory_name, status, reason, error_type, related_operation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (run_id, sequence_index, action,
                  str(source_path) if source_path is not None else None,
                  str(destination_path) if destination_path is not None else None,
-                 file_size, source_mtime_ns, sha256, status, reason, error_type, related_operation_id, utc_now()),
+                 file_size, source_mtime_ns, sha256, directory_name, status, reason, error_type,
+                 related_operation_id, utc_now()),
             )
             return int(cursor.lastrowid)
 
@@ -374,6 +401,7 @@ class Database:
                 """
                 SELECT * FROM operations
                 WHERE run_id = ? AND action = 'mkdir' AND status = 'success'
+                  AND source_path IS NOT NULL AND directory_name IS NOT NULL
                 ORDER BY LENGTH(destination_path) DESC, id DESC
                 """,
                 (run_id,),

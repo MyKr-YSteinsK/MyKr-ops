@@ -46,7 +46,7 @@ mykr-ops notes --apply
 
 The organizer never overwrites an existing target. An identical target is reported as a duplicate and both files remain. Different content, a target directory, or competing source files are reported as conflicts and remain untouched.
 Each move must stay on the same filesystem volume; cross-volume moves fail safely and leave the source unchanged.
-Only direct ordinary lowercase `.md` files are considered; subdirectories, symbolic links, junctions, and other reparse points are left untouched.
+Destination directories are verified beneath the fixed configured study root before a move. Only direct ordinary lowercase `.md` files are considered; subdirectories, symbolic links, junctions, and other reparse points are left untouched.
 
 Undo the latest eligible apply run, or inspect recorded history:
 
@@ -56,7 +56,7 @@ mykr-ops history
 mykr-ops history --run 12
 ```
 
-Before an apply or undo move, MyKr-ops commits a prepared operation record and holds an exclusive local mutation lock. If a previous command was interrupted, the next apply or undo first reconciles the recorded source and destination paths using SHA-256. Confirmed completed moves are restored to normal history; ambiguous states are marked `recovery_required`, leave both paths untouched, and block new file changes until you manually resolve the filesystem state and rerun the command. `history --run` shows these states and a stable `error_type` for failed filesystem operations.
+Before an apply or undo move, MyKr-ops commits a prepared operation record and holds an exclusive local mutation lock. Directory creation uses the same durable prepare-and-verify pattern. If a previous command was interrupted, the next apply or undo first reconciles recorded files and directory intents without creating or deleting anything. Confirmed completed moves and directories are restored to normal history; ambiguous states are marked `recovery_required`, leave paths untouched, and block new file changes until you manually resolve the filesystem state and rerun the command. `history --run` shows these states and a stable `error_type` for failed filesystem operations.
 
 Apply and undo records are stored in `%LOCALAPPDATA%\mykr-ops\mykr-ops.db` (or `%USERPROFILE%\.mykr-ops\mykr-ops.db` when `LOCALAPPDATA` is unavailable). Logs are written alongside it as `mykr-ops.log`. The included `scripts\preview-notes.cmd` and `scripts\apply-notes.cmd` wrappers are suitable for double-click use and stay open after printing results.
 

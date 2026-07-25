@@ -109,8 +109,14 @@ def test_windows_move_uses_verified_parent_handle_and_relative_name(
         assert information_class == filesystem._FILE_RENAME_INFORMATION_CLASS
         assert parent_handles == [int(rename_info.RootDirectory)]
         assert not rename_info.ReplaceIfExists
+        assert rename_info.FileNameLength == len(destination.name.encode("utf-16-le"))
+        assert buffer_size == max(
+            ctypes.sizeof(filesystem._FileRenameInformation),
+            filesystem._FileRenameInformation.FileName.offset + rename_info.FileNameLength,
+        )
         assert encoded_name.decode("utf-16-le") == destination.name
         assert Path(encoded_name.decode("utf-16-le")).name == destination.name
+        assert str(destination).encode("utf-16-le") not in ctypes.string_at(rename_buffer, buffer_size)
         return actual_rename(source_handle, io_status, rename_buffer, buffer_size, information_class)
 
     monkeypatch.setattr(filesystem, "_open_directory_handle", record_parent_handle)
@@ -129,6 +135,121 @@ def test_windows_move_uses_verified_parent_handle_and_relative_name(
     finally:
         filesystem._close_handle(after_handle)
     assert before_identity[:2] == after_identity[:2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle-relative rename")
+def test_windows_native_rename_supports_unicode_relative_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.md"
+    destination = tmp_path / "笔记-鹿.md"
+    source.write_text("note", encoding="utf-8")
+    actual_rename = filesystem._nt_set_information_file
+
+    def inspect_unicode_name(
+        source_handle: int,
+        io_status: object,
+        rename_buffer: object,
+        buffer_size: int,
+        information_class: int,
+    ) -> int:
+        rename_info = ctypes.cast(
+            rename_buffer, ctypes.POINTER(filesystem._FileRenameInformation)
+        ).contents
+        encoded_name = ctypes.string_at(
+            ctypes.addressof(rename_buffer) + filesystem._FileRenameInformation.FileName.offset,
+            rename_info.FileNameLength,
+        )
+        assert encoded_name.decode("utf-16-le") == destination.name
+        assert rename_info.FileNameLength == len(destination.name.encode("utf-16-le"))
+        return actual_rename(source_handle, io_status, rename_buffer, buffer_size, information_class)
+
+    monkeypatch.setattr(filesystem, "_nt_set_information_file", inspect_unicode_name)
+    move_with_snapshot(source, destination)
+
+    assert destination.read_text(encoding="utf-8") == "note"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fixed-root containment")
+def test_windows_verified_root_rejects_similar_prefix_parent_and_keeps_handle_identity(tmp_path: Path) -> None:
+    study = tmp_path / "Study"
+    study_backup = tmp_path / "StudyBackup"
+    child = study / "CS"
+    study.mkdir()
+    study_backup.mkdir()
+    child.mkdir()
+
+    with filesystem.open_verified_directory_root(study, "study root") as root:
+        assert root is not None
+        assert root.identity[:2] == filesystem._handle_identity(root.handle, "study root")[:2]
+        child_handle = filesystem._open_verified_directory_under_root(root, child, "destination directory")
+        try:
+            assert filesystem._handle_identity(child_handle, "destination directory")[0] == root.identity[0]
+            assert filesystem._final_path_is_descendant(
+                filesystem._final_path_from_handle(child_handle, "destination directory"), root.final_path
+            )
+        finally:
+            filesystem._close_handle(child_handle)
+        with pytest.raises(filesystem.FilesystemSafetyError, match="escapes verified root") as exc_info:
+            filesystem._open_verified_directory_under_root(root, study_backup, "destination directory")
+
+    assert exc_info.value.error_type == "path_escape"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fixed-root containment")
+def test_windows_final_path_normalization_uses_component_boundaries_and_unicode() -> None:
+    assert filesystem._normalize_final_path(r"\\?\C:\Study\目录\\") == r"C:\Study\目录"
+    assert filesystem._normalize_final_path(r"\\?\UNC\server\share\Study") == r"\\server\share\Study"
+    assert filesystem._final_path_is_descendant(r"\\?\C:\sTuDy\目录", r"C:\Study")
+    assert not filesystem._final_path_is_descendant(r"\\?\C:\StudyBackup", r"C:\Study")
+    assert filesystem._final_path_is_descendant(
+        r"\\?\Volume{ABC}\Study\目录", r"\\?\Volume{abc}\Study"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fixed-root containment")
+def test_windows_root_path_cannot_be_replaced_while_handle_relative_move_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.md"
+    study = tmp_path / "Study"
+    replacement = tmp_path / "replacement"
+    destination_parent = study / "CS"
+    study.mkdir()
+    destination_parent.mkdir()
+    source.write_text("note", encoding="utf-8")
+    destination = destination_parent / "destination.md"
+    attempts: list[OSError] = []
+    actual_rename = filesystem._nt_set_information_file
+
+    def attempt_root_replacement(
+        source_handle: int,
+        io_status: object,
+        rename_buffer: object,
+        buffer_size: int,
+        information_class: int,
+    ) -> int:
+        try:
+            study.rename(replacement)
+        except OSError as exc:
+            attempts.append(exc)
+        return actual_rename(source_handle, io_status, rename_buffer, buffer_size, information_class)
+
+    monkeypatch.setattr(filesystem, "_nt_set_information_file", attempt_root_replacement)
+    metadata = source.lstat()
+    with filesystem.open_verified_directory_root(study, "study root") as root:
+        filesystem.move_file_without_overwrite(
+            source,
+            destination,
+            filesystem.sha256_file(source),
+            expected_size=metadata.st_size,
+            expected_mtime_ns=metadata.st_mtime_ns,
+            destination_root=root,
+        )
+
+    assert attempts
+    assert destination.read_text(encoding="utf-8") == "note"
+    assert not replacement.exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native handle-relative rename")
