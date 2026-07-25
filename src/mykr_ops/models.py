@@ -71,6 +71,7 @@ class RunResult:
     failed_count: int
     created_dir_count: int
     ignored_count: int = 0
+    recovery_operation_id: int | None = None
 
 
 @dataclass
@@ -90,3 +91,4 @@ class UndoResult:
     failed_count: int
     removed_dir_count: int
     message: str | None = None
+    recovery_operation_id: int | None = None

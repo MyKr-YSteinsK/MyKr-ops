@@ -45,6 +45,7 @@ mykr-ops notes --apply
 ```
 
 The organizer never overwrites an existing target. An identical target is reported as a duplicate and both files remain. Different content, a target directory, or competing source files are reported as conflicts and remain untouched.
+Each move must stay on the same filesystem volume; cross-volume moves fail safely and leave the source unchanged.
 Only direct ordinary lowercase `.md` files are considered; subdirectories, symbolic links, junctions, and other reparse points are left untouched.
 
 Undo the latest eligible apply run, or inspect recorded history:

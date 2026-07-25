@@ -69,6 +69,13 @@ def _print_apply(result: RunResult) -> None:
         f"invalid={result.invalid_count}, failed={result.failed_count}, "
         f"created-directories={result.created_dir_count}, run ID={result.run_id}"
     )
+    if result.recovery_operation_id is not None:
+        print(
+            "Manual recovery required: "
+            f"run ID={result.run_id}, operation ID={result.recovery_operation_id}. "
+            f"Inspect `mykr-ops history --run {result.run_id}` and resolve the filesystem state "
+            "before another apply or undo."
+        )
 
 
 def _print_undo(result: UndoResult) -> None:
@@ -84,6 +91,13 @@ def _print_undo(result: UndoResult) -> None:
         f"Undo summary: restored={result.moved_count}, failed={result.failed_count}, "
         f"removed-directories={result.removed_dir_count}, run ID={result.run_id}"
     )
+    if result.recovery_operation_id is not None:
+        print(
+            "Manual recovery required: "
+            f"run ID={result.run_id}, operation ID={result.recovery_operation_id}. "
+            f"Inspect `mykr-ops history --run {result.run_id}` and resolve the filesystem state "
+            "before another apply or undo."
+        )
 
 
 def _print_history(database: Database | None, run_id: int | None) -> None:
@@ -122,7 +136,19 @@ def main(argv: list[str] | None = None) -> int:
         state_dir = application_data_dir(create=False)
         database_path = state_dir / "mykr-ops.db"
         if args.command == "history":
-            _print_history(Database(database_path) if database_path.exists() else None, args.run)
+            if not database_path.exists():
+                _print_history(None, args.run)
+                return 0
+            database = Database(database_path)
+            with database.mutation_lock():
+                # Existing Phase 1 and 2A databases must be migrated before any
+                # history query. The existence checks keep history read-only when
+                # no application database has ever been created.
+                if database_path.exists():
+                    database.initialize()
+                    _print_history(database, args.run)
+                else:
+                    _print_history(None, args.run)
             return 0
         if args.command == "undo" and not database_path.exists():
             _print_undo(undo_latest(config, None))

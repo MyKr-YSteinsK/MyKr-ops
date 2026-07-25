@@ -224,6 +224,75 @@ def test_manually_resolved_recovery_required_operation_is_reconciled_again(tmp_p
     assert database.get_run(run_id)["status"] == "failed"
 
 
+def test_apply_stops_immediately_when_current_prepared_operation_requires_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    first = config.source_dir / "01-First_CS_Course.md"
+    second = config.source_dir / "02-Second_Math_Algebra.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    database = database_for(tmp_path)
+
+    def fail_move(*_: object, **__: object) -> None:
+        raise notes.FilesystemSafetyError("simulated native rename failure")
+
+    monkeypatch.setattr(notes, "move_file_without_overwrite", fail_move)
+    monkeypatch.setattr(
+        notes,
+        "_classify_prepared_operation",
+        lambda *_: ("recovery_required", "ambiguous filesystem state", "recovery_ambiguous"),
+    )
+
+    result = notes.apply_notes(config, database)
+
+    assert result.recovery_operation_id is not None
+    assert result.moved_count == 0
+    assert result.failed_count == 2
+    assert first.exists() and second.exists()
+    assert not (config.study_root / "Math").exists()
+    operations = database.operations_for_run(result.run_id or 0)
+    move_operations = [row for row in operations if row["action"] == "move"]
+    assert len(move_operations) == 1
+    assert move_operations[0]["status"] == "recovery_required"
+    assert database.get_run(result.run_id or 0)["status"] == "failed"
+
+
+def test_undo_stops_immediately_when_current_prepared_operation_requires_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    first = config.source_dir / "01-First_CS_Course.md"
+    second = config.source_dir / "02-Second_CS_Course.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    database = database_for(tmp_path)
+    notes.apply_notes(config, database)
+
+    def fail_move(*_: object, **__: object) -> None:
+        raise notes.FilesystemSafetyError("simulated native rename failure")
+
+    monkeypatch.setattr(notes, "move_file_without_overwrite", fail_move)
+    monkeypatch.setattr(
+        notes,
+        "_classify_prepared_operation",
+        lambda *_: ("recovery_required", "ambiguous filesystem state", "recovery_ambiguous"),
+    )
+
+    result = notes.undo_latest(config, database)
+
+    assert result.recovery_operation_id is not None
+    assert result.moved_count == 0
+    assert result.failed_count == 1
+    assert not first.exists() and not second.exists()
+    assert (config.study_root / "CS" / "Course" / "01-First.md").exists()
+    assert (config.study_root / "CS" / "Course" / "02-Second.md").exists()
+    operations = database.operations_for_run(result.run_id or 0)
+    assert [row["action"] for row in operations] == ["undo_move"]
+    assert operations[0]["status"] == "recovery_required"
+    assert database.get_run(result.run_id or 0)["status"] == "failed"
+
+
 def _hold_lock(path: str, ready: object, release: object) -> None:
     database = Database(Path(path))
     with database.mutation_lock():

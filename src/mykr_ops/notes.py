@@ -567,6 +567,7 @@ def apply_notes(
     plan = plan_notes(config)
     run_id = database.create_run("notes", "apply", matched_count=plan.matched_count)
     created_directories: list[Path] = []
+    recovery_operation_id: int | None = None
 
     for sequence_index, item in enumerate(plan.items, start=1):
         if item.status != PlanStatus.READY:
@@ -654,6 +655,8 @@ def apply_notes(
                 item.destination = Path(prepared["destination_path"])
                 item.status = PlanStatus.READY if recovered_status == "success" else PlanStatus.FAILED
                 item.reason = None if recovered_status == "success" else recovered_reason
+                if recovered_status == "recovery_required":
+                    recovery_operation_id = prepared_operation_id
             else:
                 item.status = PlanStatus.FAILED
                 item.reason = str(exc)
@@ -669,12 +672,23 @@ def apply_notes(
             reason=item.reason,
             error_type=None if item.status == PlanStatus.READY else operation_error_type,
         )
+        if recovery_operation_id is not None:
+            break
 
-    for directory in sorted(set(created_directories), key=lambda path: len(path.parts), reverse=True):
-        try:
-            remove_empty_directory(directory, config.study_root)
-        except FilesystemSafetyError:
-            pass
+    if recovery_operation_id is not None:
+        stop_reason = (
+            f"not attempted because run {run_id} operation {recovery_operation_id} requires manual recovery"
+        )
+        for remaining_item in plan.items[sequence_index:]:
+            if remaining_item.status == PlanStatus.READY:
+                remaining_item.status = PlanStatus.FAILED
+                remaining_item.reason = stop_reason
+    else:
+        for directory in sorted(set(created_directories), key=lambda path: len(path.parts), reverse=True):
+            try:
+                remove_empty_directory(directory, config.study_root)
+            except FilesystemSafetyError:
+                pass
 
     counts = Counter(item.status for item in plan.items)
     moved_count = counts[PlanStatus.READY]
@@ -687,6 +701,8 @@ def apply_notes(
         f"conflicts={conflict_count}; invalid={invalid_count}; failed={failed_count}; "
         f"created_directories={len(created_directories)}"
     )
+    if recovery_operation_id is not None:
+        summary += f"; manual_recovery_operation={recovery_operation_id}"
     database.finish_run(
         run_id, status=_status_for_apply(moved_count, failed_count), summary=summary,
         matched_count=plan.matched_count, moved_count=moved_count, duplicate_count=duplicate_count,
@@ -697,6 +713,7 @@ def apply_notes(
         run_id=run_id, items=plan.items, matched_count=plan.matched_count, moved_count=moved_count,
         duplicate_count=duplicate_count, conflict_count=conflict_count, invalid_count=invalid_count,
         failed_count=failed_count, created_dir_count=len(created_directories), ignored_count=plan.ignored_count,
+        recovery_operation_id=recovery_operation_id,
     )
 
 
@@ -742,6 +759,7 @@ def undo_latest(
     successful_moves = database.successful_moves_for_run(apply_run_id)
     run_id = database.create_run("undo", "undo", matched_count=len(successful_moves))
     results: list[UndoItem] = []
+    recovery_operation_id: int | None = None
     for sequence_index, operation in enumerate(successful_moves, start=1):
         source = Path(operation["source_path"])
         destination = Path(operation["destination_path"])
@@ -795,6 +813,8 @@ def undo_latest(
                     prepared_operation_id, recovered_status, recovered_reason, operation_error_type
                 )
                 results.append(UndoItem(destination, source, "failed", recovered_reason))
+                if recovered_status == "recovery_required":
+                    recovery_operation_id = prepared_operation_id
             else:
                 database.record_operation(
                     run_id=run_id,
@@ -814,41 +834,44 @@ def undo_latest(
                 source=destination, destination=source, reason=results[-1].reason,
                 error_type=operation_error_type,
             )
+            if recovery_operation_id is not None:
+                break
 
     removed_dir_count = 0
-    for sequence_index, operation in enumerate(database.created_directories_for_run(apply_run_id), start=1):
-        directory = Path(operation["destination_path"])
-        error_type: str | None = None
-        try:
-            removed = remove_empty_directory(directory, config.study_root)
-            status = "success" if removed else "skipped"
-            reason = None if removed else "directory is absent or not empty"
-            removed_dir_count += int(removed)
-        except FilesystemSafetyError as exc:
-            status = "failed"
-            reason = str(exc)
-            error_type = _error_type_for_exception(exc)
-        database.record_operation(
-            run_id=run_id,
-            sequence_index=sequence_index,
-            action="undo_rmdir",
-            status=status,
-            destination_path=directory,
-            reason=reason,
-            error_type=error_type,
-            related_operation_id=int(operation["id"]),
-        )
-        _log_operation(
-            logger,
-            level=logging.INFO if status != "failed" else logging.ERROR,
-            run_id=run_id,
-            action="undo_rmdir",
-            status=status,
-            source=None,
-            destination=directory,
-            reason=reason,
-            error_type=error_type,
-        )
+    if recovery_operation_id is None:
+        for sequence_index, operation in enumerate(database.created_directories_for_run(apply_run_id), start=1):
+            directory = Path(operation["destination_path"])
+            error_type: str | None = None
+            try:
+                removed = remove_empty_directory(directory, config.study_root)
+                status = "success" if removed else "skipped"
+                reason = None if removed else "directory is absent or not empty"
+                removed_dir_count += int(removed)
+            except FilesystemSafetyError as exc:
+                status = "failed"
+                reason = str(exc)
+                error_type = _error_type_for_exception(exc)
+            database.record_operation(
+                run_id=run_id,
+                sequence_index=sequence_index,
+                action="undo_rmdir",
+                status=status,
+                destination_path=directory,
+                reason=reason,
+                error_type=error_type,
+                related_operation_id=int(operation["id"]),
+            )
+            _log_operation(
+                logger,
+                level=logging.INFO if status != "failed" else logging.ERROR,
+                run_id=run_id,
+                action="undo_rmdir",
+                status=status,
+                source=None,
+                destination=directory,
+                reason=reason,
+                error_type=error_type,
+            )
 
     moved_count = sum(item.status == "success" for item in results)
     failed_count = sum(item.status == "failed" for item in results)
@@ -857,16 +880,26 @@ def undo_latest(
         f"apply_run={apply_run_id}; restored={moved_count}; failed={failed_count}; "
         f"removed_directories={removed_dir_count}"
     )
+    if recovery_operation_id is not None:
+        summary += f"; manual_recovery_operation={recovery_operation_id}"
     database.finish_run(
         run_id,
         status=status,
         summary=summary,
-        matched_count=len(results),
+        matched_count=len(successful_moves),
         moved_count=moved_count,
         failed_count=failed_count,
         created_dir_count=removed_dir_count,
     )
-    return UndoResult(run_id, apply_run_id, results, moved_count, failed_count, removed_dir_count)
+    return UndoResult(
+        run_id,
+        apply_run_id,
+        results,
+        moved_count,
+        failed_count,
+        removed_dir_count,
+        recovery_operation_id=recovery_operation_id,
+    )
 
 
 def history_rows(database: Database | None, run_id: int | None = None) -> Iterable[object]:

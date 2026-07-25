@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mykr_ops import notes
+from mykr_ops import cli, notes
 from mykr_ops.database import Database, DatabaseSchemaError
 from mykr_ops.models import NotesConfig
 
@@ -179,6 +179,43 @@ def test_phase2a_database_gains_error_type_without_losing_history(tmp_path: Path
     assert row[2].endswith("01-Topic.md")
     assert row[3]
     assert row[4] is None
+
+
+@pytest.mark.parametrize("create_database", [create_phase1_database, create_phase2a_database])
+def test_history_migrates_existing_legacy_database_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    create_database: object,
+) -> None:
+    config = make_config(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    path = state_dir / "mykr-ops.db"
+    create_database(path, config)  # type: ignore[operator]
+    monkeypatch.setattr(cli, "load_notes_config", lambda: config)
+    monkeypatch.setattr(cli, "application_data_dir", lambda *, create: state_dir)
+
+    assert cli.main(["history"]) == 0
+
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    connection.close()
+    assert "Run 7: notes apply success" in capsys.readouterr().out
+
+
+def test_history_without_database_does_not_create_state_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = make_config(tmp_path)
+    state_dir = tmp_path / "absent-state"
+    monkeypatch.setattr(cli, "load_notes_config", lambda: config)
+    monkeypatch.setattr(cli, "application_data_dir", lambda *, create: state_dir)
+
+    assert cli.main(["history"]) == 0
+
+    assert not state_dir.exists()
+    assert capsys.readouterr().out == "No recorded runs.\n"
 
 
 def test_unknown_schema_stops_safely(tmp_path: Path) -> None:

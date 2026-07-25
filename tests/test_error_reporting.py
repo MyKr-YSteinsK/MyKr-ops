@@ -9,7 +9,7 @@ import pytest
 
 from mykr_ops import cli, filesystem, notes
 from mykr_ops.database import Database
-from mykr_ops.models import NotesConfig
+from mykr_ops.models import NotesConfig, RunResult, UndoResult
 
 
 def make_config(tmp_path: Path) -> NotesConfig:
@@ -66,6 +66,41 @@ def test_operation_log_includes_structured_error_type() -> None:
         logger.removeHandler(handler)
 
     assert "error_type=destination_exists" in stream.getvalue()
+
+
+def test_recovery_required_output_identifies_run_and_operation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._print_apply(
+        RunResult(
+            run_id=12,
+            items=[],
+            matched_count=1,
+            moved_count=0,
+            duplicate_count=0,
+            conflict_count=0,
+            invalid_count=0,
+            failed_count=1,
+            created_dir_count=0,
+            recovery_operation_id=34,
+        )
+    )
+    cli._print_undo(
+        UndoResult(
+            run_id=13,
+            apply_run_id=12,
+            items=[],
+            moved_count=0,
+            failed_count=1,
+            removed_dir_count=0,
+            recovery_operation_id=35,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "run ID=12, operation ID=34" in output
+    assert "mykr-ops history --run 12" in output
+    assert "run ID=13, operation ID=35" in output
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows sharing-mode integration")

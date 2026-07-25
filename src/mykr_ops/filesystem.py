@@ -184,9 +184,10 @@ def move_file_without_overwrite(
 ) -> None:
     """Move one file atomically without replacing an existing destination.
 
-    Windows uses a source-file handle and ``SetFileInformationByHandle``.  Keeping that
-    handle open denies concurrent writes, deletes, and renames while the move is being
-    checked and committed.  The non-Windows path exists only for portable test coverage.
+    Windows uses a source-file handle with ``NtSetInformationFile`` and an open,
+    verified destination-directory handle. Keeping both handles open binds the
+    rename to that directory object while the move is checked and committed. The
+    non-Windows path exists only for portable test coverage.
     """
     if not is_ordinary_file(source):
         raise FilesystemSafetyError(f"source is not an ordinary file: {source}", error_type="source_missing")
@@ -248,11 +249,16 @@ if os.name == "nt":
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
     _FILE_SHARE_DELETE = 0x00000004
+    _FILE_LIST_DIRECTORY = 0x00000001
+    _FILE_ADD_FILE = 0x00000002
+    _FILE_READ_ATTRIBUTES = 0x00000080
+    _SYNCHRONIZE = 0x00100000
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     _FILE_TYPE_DISK = 0x0001
-    _FILE_RENAME_INFO_CLASS = 3
+    _FILE_ATTRIBUTE_DIRECTORY = 0x0010
+    _FILE_RENAME_INFORMATION_CLASS = 10
     _CSTR_EQUAL = 2
     _ERROR_FILE_EXISTS = 80
     _ERROR_ALREADY_EXISTS = 183
@@ -287,6 +293,9 @@ if os.name == "nt":
             ("FileName", wintypes.WCHAR * 1),
         ]
 
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_long), ("Information", ctypes.c_size_t)]
+
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _create_file = _kernel32.CreateFileW
     _create_file.argtypes = [
@@ -314,14 +323,28 @@ if os.name == "nt":
         wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD,
     ]
     _set_file_pointer.restype = wintypes.BOOL
-    _set_file_information = _kernel32.SetFileInformationByHandle
-    _set_file_information.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
-    _set_file_information.restype = wintypes.BOOL
     _compare_string_ordinal = _kernel32.CompareStringOrdinal
     _compare_string_ordinal.argtypes = [
         wintypes.LPCWSTR, ctypes.c_int, wintypes.LPCWSTR, ctypes.c_int, wintypes.BOOL,
     ]
     _compare_string_ordinal.restype = ctypes.c_int
+    _ntdll = ctypes.WinDLL("ntdll")
+    try:
+        _nt_set_information_file = _ntdll.NtSetInformationFile
+        _nt_set_information_file.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IoStatusBlock),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        _nt_set_information_file.restype = ctypes.c_long
+        _rtl_nt_status_to_dos_error = _ntdll.RtlNtStatusToDosError
+        _rtl_nt_status_to_dos_error.argtypes = [ctypes.c_long]
+        _rtl_nt_status_to_dos_error.restype = wintypes.ULONG
+    except AttributeError:
+        _nt_set_information_file = None
+        _rtl_nt_status_to_dos_error = None
 
 
 def _move_file_windows(
@@ -357,6 +380,14 @@ def _move_file_windows(
             )
 
         _rename_handle_without_overwrite(source_handle, destination_parent_handle, destination)
+
+        if _handle_identity(
+            destination_parent_handle, f"destination directory {destination.parent}"
+        )[:2] != parent_identity[:2]:
+            raise FilesystemSafetyError(
+                f"destination directory identity changed during move: {destination.parent}",
+                error_type="unsafe_reparse_point",
+            )
 
         if path_exists_no_follow(source):
             raise FilesystemSafetyError(f"source still exists after move: {source}")
@@ -407,13 +438,17 @@ def _open_regular_file_handle(
 
 def _open_directory_handle(path: Path) -> int:
     handle = _create_file(
-        str(path), _GENERIC_READ, _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        str(path), _FILE_LIST_DIRECTORY | _FILE_ADD_FILE | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
         None, _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
     )
     if handle == _INVALID_HANDLE_VALUE:
         _raise_windows_error(f"could not safely open destination directory {path}")
     identity = _handle_identity(handle, f"destination directory {path}")
+    if not identity[4] & _FILE_ATTRIBUTE_DIRECTORY:
+        _close_handle(handle)
+        raise FilesystemSafetyError(f"destination directory is not a directory: {path}")
     if identity[4] & FILE_ATTRIBUTE_REPARSE_POINT:
         _close_handle(handle)
         raise FilesystemSafetyError(
@@ -453,29 +488,83 @@ def _hash_handle(handle: int, description: str) -> str:
         digest.update(buffer.raw[:read_count.value])
 
 
-def _rename_handle_without_overwrite(source_handle: int, _parent_handle: int, destination: Path) -> None:
-    encoded_name = str(destination).encode("utf-16-le")
-    # Windows validates the full FILE_RENAME_INFO allocation, including its one
-    # wide-character array member, before reading FileNameLength.
-    buffer_size = ctypes.sizeof(_FileRenameInformation) + len(encoded_name)
+def _rename_handle_without_overwrite(source_handle: int, parent_handle: int, destination: Path) -> None:
+    """Rename relative to an already-verified target directory handle only."""
+    relative_name = destination.name
+    if relative_name in {"", ".", ".."} or Path(relative_name).name != relative_name:
+        raise FilesystemSafetyError(
+            f"destination must be a simple relative filename: {destination}",
+            error_type="path_escape",
+        )
+    if _nt_set_information_file is None:
+        raise FilesystemSafetyError(
+            "NtSetInformationFile is unavailable for handle-relative rename",
+            error_type="unsupported_filesystem",
+        )
+
+    encoded_name = relative_name.encode("utf-16-le")
+    buffer_size = _FileRenameInformation.FileName.offset + len(encoded_name)
     rename_buffer = ctypes.create_string_buffer(buffer_size)
     rename_info = ctypes.cast(rename_buffer, ctypes.POINTER(_FileRenameInformation)).contents
     rename_info.ReplaceIfExists = False
-    # SetFileInformationByHandle does not accept a directory handle for
-    # FileRenameInfo on all supported local filesystems.  The already-open
-    # parent handle is still used to verify the local volume and reject reparse
-    # points immediately before the handle-level rename.
-    rename_info.RootDirectory = None
+    rename_info.RootDirectory = parent_handle
     rename_info.FileNameLength = len(encoded_name)
     ctypes.memmove(
         ctypes.addressof(rename_buffer) + _FileRenameInformation.FileName.offset,
         encoded_name,
         len(encoded_name),
     )
-    if not _set_file_information(
-        source_handle, _FILE_RENAME_INFO_CLASS, rename_buffer, buffer_size
-    ):
-        _raise_windows_error("could not rename source without overwriting the destination")
+    io_status = _IoStatusBlock()
+    status = _nt_set_information_file(
+        source_handle,
+        ctypes.byref(io_status),
+        rename_buffer,
+        buffer_size,
+        _FILE_RENAME_INFORMATION_CLASS,
+    )
+    if not _nt_success(status):
+        _raise_ntstatus_error("could not rename source relative to verified destination directory", status)
+    if not _nt_success(io_status.Status):
+        _raise_ntstatus_error(
+            "could not rename source relative to verified destination directory", io_status.Status
+        )
+
+
+def _nt_success(status: int) -> bool:
+    return ctypes.c_long(status).value >= 0
+
+
+def _ntstatus_value(status: int) -> int:
+    return ctypes.c_ulong(status).value & 0xFFFFFFFF
+
+
+def _raise_ntstatus_error(message: str, status: int) -> None:
+    status_value = _ntstatus_value(status)
+    if status_value == 0xC0000035:
+        error_type = "destination_exists"
+        prefix = "destination already exists"
+    elif status_value == 0xC00000D4:
+        error_type = "cross_volume"
+        prefix = "cross-volume moves are not supported"
+    elif status_value in {0xC0000043, 0xC0000054, 0xC0000022}:
+        error_type = "destination_locked"
+        prefix = "destination directory is locked or cannot be safely shared"
+    elif status_value in {0xC00000BB, 0xC0000010}:
+        error_type = "unsupported_filesystem"
+        prefix = "handle-relative rename is not supported"
+    else:
+        error_type = "unknown_filesystem_error"
+        prefix = "handle-relative rename failed"
+    dos_error = (
+        int(_rtl_nt_status_to_dos_error(ctypes.c_long(status).value))
+        if _rtl_nt_status_to_dos_error is not None
+        else None
+    )
+    converted = f"; DOS error {dos_error}" if dos_error is not None else ""
+    raise FilesystemSafetyError(
+        f"{prefix}: {message}; NTSTATUS 0x{status_value:08X}{converted}",
+        error_type=error_type,
+    )
 
 
 def _raise_windows_error(message: str) -> None:
