@@ -34,12 +34,6 @@ def test_preserves_underscores_in_topic() -> None:
         ("01-Top:ic_CS_Course.md", "invalid Windows"),
         ("01-Topic_CON_Course.md", "reserved"),
         ("01-Topic_CS_CON.txt.md", "reserved"),
-        ("01-Topic_COM鹿_Course.md", "reserved"),
-        ("01-Topic_COM虏_Course.md", "reserved"),
-        ("01-Topic_COM鲁_Course.md", "reserved"),
-        ("01-Topic_CS_LPT鹿.md", "reserved"),
-        ("01-Topic_CS_LPT虏.txt.md", "reserved"),
-        ("01-Topic_CS_LPT鲁.md", "reserved"),
         ("01-Topic_COM¹_Course.md", "reserved"),
         ("01-Topic_CS_LPT².md", "reserved"),
         ("01-Topic_ CS_Course.md", "whitespace"),
@@ -54,6 +48,38 @@ def test_rejects_invalid_note_filename(name: str, message: str) -> None:
 def test_directory_components_reject_underscores() -> None:
     with pytest.raises(FilenameError, match="underscore"):
         _validate_component("CS_notes", "first-level directory", allow_underscores=False)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "01-Topic_COM" + chr(0x00B9) + "_Course.md",
+        "01-Topic_COM" + chr(0x00B2) + "_Course.md",
+        "01-Topic_COM" + chr(0x00B3) + "_Course.md",
+        "01-Topic_CS_LPT" + chr(0x00B9) + ".md",
+        "01-Topic_CS_LPT" + chr(0x00B2) + ".txt.md",
+        "01-Topic_CS_LPT" + chr(0x00B3) + ".md",
+    ],
+)
+def test_rejects_superscript_windows_device_names(name: str) -> None:
+    with pytest.raises(FilenameError, match="reserved"):
+        parse_note_filename(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "01-Topic_COM" + chr(0x9E7F) + chr(0x7F1A) + "_Course.md",
+        "01-Topic_COM" + chr(0x864F) + chr(0x5EEF) + "_Course.md",
+        "01-Topic_COM" + chr(0x9C81) + chr(0x4E63) + "_Course.md",
+        "01-Topic_CS_LPT" + chr(0x9E7F) + ".md",
+        "01-Topic_CS_LPT" + chr(0x864F) + ".md",
+        "01-Topic_CS_LPT" + chr(0x9C81) + ".md",
+        "01-Topic_" + chr(0x8BFE) + chr(0x7A0B) + "_" + chr(0x732B) + chr(0x5496) + ".md",
+    ],
+)
+def test_unrelated_unicode_device_prefixes_remain_valid(name: str) -> None:
+    assert parse_note_filename(name).original_name == name
 
 
 def test_unrelated_unicode_directory_components_remain_valid() -> None:

@@ -329,6 +329,95 @@ def test_absent_prepared_directory_recovers_as_failed_without_creating_it(tmp_pa
     assert not (config.study_root / "CS").exists()
 
 
+def test_current_directory_failure_is_immediately_reconciled_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    source = config.source_dir / "01-Topic_CS_Course.md"
+    source.write_text("note", encoding="utf-8")
+    database = database_for(tmp_path)
+    actual_create = notes.create_child_directory
+
+    def create_then_report_failure(*args: object, **kwargs: object) -> tuple[Path, bool]:
+        child, created = actual_create(*args, **kwargs)  # type: ignore[arg-type]
+        if child.name == "CS" and created:
+            raise notes.FilesystemSafetyError("simulated post-create validation failure")
+        return child, created
+
+    monkeypatch.setattr(notes, "create_child_directory", create_then_report_failure)
+    result = notes.apply_notes(config, database)
+
+    mkdir_operations = [
+        row for row in database.operations_for_run(result.run_id or 0) if row["action"] == "mkdir"
+    ]
+    assert result.moved_count == 1
+    assert [row["status"] for row in mkdir_operations] == ["success", "success"]
+    assert (config.study_root / "CS" / "Course" / "01-Topic.md").exists()
+
+
+def test_current_directory_clear_failure_allows_later_independent_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    first = config.source_dir / "01-Fail_CS_Course.md"
+    second = config.source_dir / "02-Works_Math_Algebra.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    database = database_for(tmp_path)
+    actual_create = notes.create_child_directory
+
+    def fail_absent_cs(parent: Path, name: str, root: Path, **kwargs: object) -> tuple[Path, bool]:
+        if name == "CS":
+            raise notes.FilesystemSafetyError("simulated directory lock")
+        return actual_create(parent, name, root, **kwargs)
+
+    monkeypatch.setattr(notes, "create_child_directory", fail_absent_cs)
+    result = notes.apply_notes(config, database)
+
+    operations = database.operations_for_run(result.run_id or 0)
+    cs_directory = next(row for row in operations if row["action"] == "mkdir" and row["directory_name"] == "CS")
+    assert cs_directory["status"] == "failed"
+    assert cs_directory["error_type"] == "unknown_filesystem_error"
+    assert result.failed_count == 1
+    assert result.moved_count == 1
+    assert first.exists()
+    assert (config.study_root / "Math" / "Algebra" / "02-Works.md").exists()
+
+
+def test_current_directory_ambiguous_failure_stops_batch_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    first = config.source_dir / "01-First_CS_Course.md"
+    second = config.source_dir / "02-Second_Math_Algebra.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    database = database_for(tmp_path)
+
+    def leave_ambiguous_file(parent: Path, name: str, *_: object, **__: object) -> tuple[Path, bool]:
+        child = parent / name
+        child.write_text("user file", encoding="utf-8")
+        raise notes.FilesystemSafetyError("simulated directory validation failure")
+
+    monkeypatch.setattr(notes, "create_child_directory", leave_ambiguous_file)
+    result = notes.apply_notes(config, database)
+
+    operations = database.operations_for_run(result.run_id or 0)
+    mkdir_operations = [row for row in operations if row["action"] == "mkdir"]
+    mkdir_operation = mkdir_operations[0]
+    move_operations = [row for row in operations if row["action"] == "move"]
+    assert result.recovery_operation_id == mkdir_operation["id"]
+    assert mkdir_operation["status"] == "recovery_required"
+    assert result.failed_count == 2
+    assert len(mkdir_operations) == 1
+    assert len(move_operations) == 1
+    assert move_operations[0]["status"] == "failed"
+    assert first.exists() and second.exists()
+    assert (config.study_root / "CS").read_text(encoding="utf-8") == "user file"
+    assert not (config.study_root / "Math").exists()
+    assert "manual_recovery_operation=" + str(mkdir_operation["id"]) in database.get_run(result.run_id or 0)["summary"]
+
+
 @pytest.mark.parametrize("state", ["file", "wrong_parent"])
 def test_ambiguous_prepared_directory_requires_manual_recovery_without_changes(
     tmp_path: Path, state: str

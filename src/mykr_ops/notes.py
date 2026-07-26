@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import logging
 import sqlite3
 from pathlib import Path
@@ -48,8 +49,8 @@ RESERVED_WINDOWS_NAMES = {
     "NUL",
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
-    *(f"COM{suffix}" for suffix in ("¹", "²", "³", "鹿", "虏", "鲁")),
-    *(f"LPT{suffix}" for suffix in ("¹", "²", "³", "鹿", "虏", "鲁")),
+    *(f"COM{suffix}" for suffix in ("\N{SUPERSCRIPT ONE}", "\N{SUPERSCRIPT TWO}", "\N{SUPERSCRIPT THREE}")),
+    *(f"LPT{suffix}" for suffix in ("\N{SUPERSCRIPT ONE}", "\N{SUPERSCRIPT TWO}", "\N{SUPERSCRIPT THREE}")),
 }
 ERROR_TYPES = frozenset({
     "source_changed",
@@ -72,12 +73,39 @@ class FilenameError(ValueError):
     """Raised when a filename violates the study-note contract."""
 
 
+@dataclass(frozen=True)
+class DirectoryOperationResult:
+    """The classified outcome of one durable directory intent."""
+
+    path: Path
+    created: bool
+    operation_id: int | None
+    status: str
+    reason: str | None = None
+    error_type: str | None = None
+    created_directories: tuple[Path, ...] = ()
+
+
+class DirectoryOperationError(FilesystemSafetyError):
+    """Carries the immediately reconciled result of a failed directory intent."""
+
+    def __init__(self, result: DirectoryOperationResult) -> None:
+        super().__init__(result.reason or "directory operation failed", error_type=result.error_type)
+        self.result = result
+
+
 class DirectoryCreationError(FilesystemSafetyError):
     """Retains directories created before a later directory step failed."""
 
-    def __init__(self, message: str, created_directories: list[Path]) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        created_directories: list[Path],
+        directory_operation: DirectoryOperationError | None = None,
+    ) -> None:
+        super().__init__(message, error_type=directory_operation.error_type if directory_operation else None)
         self.created_directories = created_directories
+        self.directory_operation = directory_operation
 
 
 class RecoveryRequiredError(RuntimeError):
@@ -359,50 +387,62 @@ def _ensure_destination_directories(
     root = config.study_root
     created: list[Path] = []
     try:
-        first_level, first_created = _create_recorded_child_directory(
+        first_level_result = _create_recorded_child_directory(
             root,
             parsed.first_level,
             root,
+            config,
             database,
             run_id,
             sequence_index,
             verified_root,
             logger,
         )
-        if first_created:
-            created.append(first_level)
-        course, course_created = _create_recorded_child_directory(
-            first_level,
+        created.extend(first_level_result.created_directories)
+        course_result = _create_recorded_child_directory(
+            first_level_result.path,
             parsed.course,
             root,
+            config,
             database,
             run_id,
             sequence_index,
             verified_root,
             logger,
         )
-        if course_created:
-            created.append(course)
+        created.extend(course_result.created_directories)
+    except DirectoryOperationError as exc:
+        if created:
+            raise DirectoryCreationError(str(exc), created, exc) from exc
+        raise
     except FilesystemSafetyError as exc:
         if created:
             raise DirectoryCreationError(str(exc), created) from exc
         raise
-    return course / parsed.target_name, created
+    return course_result.path / parsed.target_name, created
 
 
 def _create_recorded_child_directory(
     parent: Path,
     name: str,
     root: Path,
+    config: NotesConfig,
     database: Database,
     run_id: int,
     sequence_index: int,
     verified_root: VerifiedDirectoryRoot | None,
     logger: logging.Logger | None,
-) -> tuple[Path, bool]:
+) -> DirectoryOperationResult:
     child, needs_creation = resolve_child_directory(parent, name, root)
     if not needs_creation:
-        return create_child_directory(parent, name, root, verified_root=verified_root)
+        actual_child, created = create_child_directory(parent, name, root, verified_root=verified_root)
+        return DirectoryOperationResult(
+            actual_child,
+            created,
+            None,
+            "success",
+            created_directories=(actual_child,) if created else (),
+        )
 
     operation_id = database.prepare_operation(
         run_id=run_id,
@@ -421,7 +461,39 @@ def _create_recorded_child_directory(
         source=parent,
         destination=child,
     )
-    actual_child, created = create_child_directory(parent, name, root, verified_root=verified_root)
+    try:
+        actual_child, created = create_child_directory(parent, name, root, verified_root=verified_root)
+    except (FilesystemSafetyError, OSError) as exc:
+        prepared = next(
+            operation
+            for operation in database.operations_for_run(run_id)
+            if int(operation["id"]) == operation_id
+        )
+        status, reason, error_type = _classify_prepared_directory(prepared, config)
+        database.update_operation_status(operation_id, status, reason, error_type)
+        result = DirectoryOperationResult(
+            child,
+            status == "success",
+            operation_id,
+            status,
+            reason,
+            error_type,
+            (child,) if status == "success" else (),
+        )
+        _log_operation(
+            logger,
+            level=logging.INFO if status == "success" else logging.ERROR,
+            run_id=run_id,
+            action="mkdir",
+            status=status,
+            source=parent,
+            destination=child,
+            reason=reason,
+            error_type=error_type,
+        )
+        if status == "success":
+            return result
+        raise DirectoryOperationError(result) from exc
     if created:
         database.update_operation_status(operation_id, "success")
         _log_operation(
@@ -433,11 +505,24 @@ def _create_recorded_child_directory(
             source=parent,
             destination=actual_child,
         )
+        return DirectoryOperationResult(
+            actual_child,
+            True,
+            operation_id,
+            "success",
+            created_directories=(actual_child,),
+        )
     else:
         database.update_operation_status(
             operation_id, "skipped", "directory appeared concurrently and was not created by this run"
         )
-    return actual_child, created
+        return DirectoryOperationResult(
+            actual_child,
+            False,
+            operation_id,
+            "skipped",
+            "directory appeared concurrently and was not created by this run",
+        )
 
 
 def _target_is_absent(destination: Path) -> None:
@@ -669,14 +754,18 @@ def apply_notes(
             return apply_notes(config, database, logger, lock_held=True)
 
     recover_interrupted_operations(config, database, logger)
-    with open_verified_directory_root(config.study_root, "study root") as destination_root:
-        return _apply_notes_with_root(config, database, logger, destination_root)
+    with (
+        open_verified_directory_root(config.source_dir, "source directory") as source_root,
+        open_verified_directory_root(config.study_root, "study root") as destination_root,
+    ):
+        return _apply_notes_with_root(config, database, logger, source_root, destination_root)
 
 
 def _apply_notes_with_root(
     config: NotesConfig,
     database: Database,
     logger: logging.Logger | None,
+    source_root: VerifiedDirectoryRoot | None,
     destination_root: VerifiedDirectoryRoot | None,
 ) -> RunResult:
     plan = plan_notes(config)
@@ -700,6 +789,7 @@ def _apply_notes_with_root(
             _verify_item_for_apply(item)
             if item.source_sha256 is None:
                 raise FilesystemSafetyError("planned item is missing source SHA-256")
+            assert_within(item.source, config.source_dir)
             snapshot_matches(item.source, item.source_size, item.source_mtime_ns, item.source_sha256)
             destination, just_created = _ensure_destination_directories(
                 item.parsed,
@@ -735,6 +825,7 @@ def _apply_notes_with_root(
                 expected_size=item.source_size,
                 expected_mtime_ns=item.source_mtime_ns,
                 destination_root=destination_root,
+                source_root=source_root,
             )
             assert_within(destination, config.study_root)
             database.update_operation_status(prepared_operation_id, "success")
@@ -746,6 +837,11 @@ def _apply_notes_with_root(
             raise
         except (FilesystemSafetyError, OSError) as exc:
             operation_error_type = _error_type_for_exception(exc)
+            directory_operation = (
+                exc
+                if isinstance(exc, DirectoryOperationError)
+                else exc.directory_operation if isinstance(exc, DirectoryCreationError) else None
+            )
             if isinstance(exc, DirectoryCreationError):
                 created_directories.extend(exc.created_directories)
             if prepared_operation_id is not None:
@@ -771,6 +867,11 @@ def _apply_notes_with_root(
                 item.status = PlanStatus.FAILED
                 item.reason = str(exc)
                 _record_item(database, run_id, sequence_index, item, operation_error_type)
+                if (
+                    directory_operation is not None
+                    and directory_operation.result.status == "recovery_required"
+                ):
+                    recovery_operation_id = directory_operation.result.operation_id
         _log_operation(
             logger,
             level=logging.INFO if item.status == PlanStatus.READY else logging.ERROR,

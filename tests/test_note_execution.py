@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from mykr_ops.database import Database
-from mykr_ops.models import NotesConfig, PlanStatus
-from mykr_ops import notes
+from mykr_ops.models import NotesConfig, PlanItem, PlanResult, PlanStatus
+from mykr_ops import filesystem, notes
 
 
 def make_config(tmp_path: Path) -> NotesConfig:
@@ -181,3 +182,68 @@ def test_apply_records_destination_hash(tmp_path: Path) -> None:
 
     assert operation["status"] == "success"
     assert operation["sha256"] == notes.sha256_file(Path(operation["destination_path"]))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fixed source-root integration")
+def test_windows_apply_uses_fixed_source_root_through_root_replacement_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    write_note(config, "01-Topic_CS_Course.md")
+    replacement = tmp_path / "Downloads-replacement"
+    actual_move = notes.move_file_without_overwrite
+    replacement_attempts: list[OSError] = []
+    source_root_identities: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    def attempt_source_root_replacement(
+        source: Path, destination: Path, digest: str, **kwargs: object
+    ) -> None:
+        source_root = kwargs["source_root"]
+        assert isinstance(source_root, filesystem.VerifiedDirectoryRoot)
+        source_root_identities.append(
+            (source_root.identity[:2], filesystem._handle_identity(source_root.handle, "source directory")[:2])
+        )
+        try:
+            config.source_dir.rename(replacement)
+        except OSError as exc:
+            replacement_attempts.append(exc)
+        actual_move(source, destination, digest, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(notes, "move_file_without_overwrite", attempt_source_root_replacement)
+    result = notes.apply_notes(config, database_for(tmp_path))
+
+    assert result.moved_count == 1
+    assert source_root_identities and source_root_identities[0][0] == source_root_identities[0][1]
+    assert replacement_attempts
+    assert (config.study_root / "CS" / "Course" / "01-Topic.md").exists()
+    assert not replacement.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fixed source-root integration")
+def test_windows_apply_rejects_source_outside_similar_prefix_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    outside = tmp_path / "DownloadsBackup"
+    outside.mkdir()
+    source = outside / "01-Topic_CS_Course.md"
+    source.write_text("note", encoding="utf-8")
+    metadata = source.stat()
+    item = PlanItem(
+        source=source,
+        status=PlanStatus.READY,
+        parsed=notes.parse_note_filename(source.name),
+        source_size=metadata.st_size,
+        source_mtime_ns=metadata.st_mtime_ns,
+    )
+    monkeypatch.setattr(notes, "plan_notes", lambda _: PlanResult(items=[item]))
+    database = database_for(tmp_path)
+
+    result = notes.apply_notes(config, database)
+
+    move = next(row for row in database.operations_for_run(result.run_id or 0) if row["action"] == "move")
+    assert result.failed_count == 1
+    assert move["error_type"] == "path_escape"
+    assert source.exists()
+    assert not (config.study_root / "CS" / "Course" / "01-Topic.md").exists()
+    assert not (config.study_root / "CS").exists()
