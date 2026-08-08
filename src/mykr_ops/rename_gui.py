@@ -535,7 +535,7 @@ class _RenameWindow:
             return False
         self.state.plan.recompute()
         self._update_rows()
-        return self.state.apply_enabled
+        return True
 
     def _update_rows(self, active_source: Path | None = None) -> None:
         self._rendering = True
@@ -562,7 +562,9 @@ class _RenameWindow:
             self._reset_manual.configure(state="normal" if has_manual and not locked else "disabled")
             for control in self._rule_controls:
                 control.configure(state="disabled" if locked else "normal")
-            self._undo.configure(state="normal" if self.state.last_apply_run_id is not None and not locked else "disabled")
+            self._undo.configure(
+                state="normal" if self.state.last_apply_run_id is not None and not self.state.busy else "disabled"
+            )
         finally:
             self._rendering = False
 
@@ -643,12 +645,18 @@ class _RenameWindow:
     def _rebase(self, paths: tuple[Path, ...]) -> None:
         fresh_plan = build_rename_plan(paths)
         self.state.plan = fresh_plan
+        self.state.locked = False
         self._last_input_error = None
         self._set_rule_variables()
+        for panel in self._panels.values():
+            panel.pack_forget()
+        self._active_panel = "transform"
+        self._panels[self._active_panel].pack(fill="x", padx=4, pady=4)
+        self._panel_host.configure(height=72)
         self._rebuild_rows()
 
     def _apply_action(self) -> None:
-        if not self._flush_pending_state():
+        if not self._flush_pending_state() or not self.state.apply_enabled:
             return
         final_paths = tuple(item.final_path for item in self.state.plan.items)
         original_paths = tuple(item.source.path for item in self.state.plan.items)
@@ -674,6 +682,7 @@ class _RenameWindow:
             self._rebase(final_paths)
         except (RenameError, FilesystemSafetyError, OSError) as exc:
             self.state.locked = True
+            self._undo.pack(side="right", padx=(0, 8))
             self._update_rows()
             self._show_error("重命名已完成，但无法安全刷新预览", exc)
             return

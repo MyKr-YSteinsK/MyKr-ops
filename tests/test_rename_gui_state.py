@@ -6,7 +6,7 @@ import pytest
 
 from mykr_ops import rename_gui
 from mykr_ops.database import Database
-from mykr_ops.rename import RenameMode, RenameResult, RenameRules, build_rename_plan
+from mykr_ops.rename import RenameError, RenameMode, RenameResult, RenameRules, build_rename_plan
 from mykr_ops.rename_gui import RenameGuiState, _RenameWindow
 
 
@@ -62,6 +62,28 @@ def test_gui_state_drag_order_recomputes_numbering(tmp_path: Path) -> None:
 
     assert [item.source.original_name for item in state.plan.items] == ["second.txt", "first.txt"]
     assert [item.final_name for item in state.plan.items] == ["1.txt", "2.txt"]
+
+
+def test_gui_can_sort_and_reorder_before_a_rename_change(tmp_path: Path) -> None:
+    first = tmp_path / "b.txt"
+    second = tmp_path / "a.txt"
+    third = tmp_path / "c.txt"
+    for path in (first, second, third):
+        path.write_text("x", encoding="utf-8")
+    window = make_window(tmp_path, [first, second, third])
+    try:
+        window._sort(False)
+        assert [item.source.original_name for item in window.state.plan.items] == ["a.txt", "b.txt", "c.txt"]
+
+        window._drag_source = first
+        window._drag_target = 2
+        window._finish_drag(None)
+        assert [item.source.original_name for item in window.state.plan.items] == ["a.txt", "c.txt", "b.txt"]
+
+        window._select_mode(RenameMode.NUMBERING, "number")
+        assert [item.final_name for item in window.state.plan.items] == ["01.txt", "02.txt", "03.txt"]
+    finally:
+        window.root.destroy()
 
 
 def test_gui_state_tracks_latest_apply_without_freezing_and_uses_large_item_modes(tmp_path: Path) -> None:
@@ -290,8 +312,16 @@ def test_gui_rebases_after_multiple_rounds_and_undoes_only_the_latest_run(tmp_pa
         first_round = window.state.last_apply_run_id
         assert first_round is not None
         assert [item.source.original_name for item in window.state.plan.items] == ["01.txt", "02.txt"]
+        assert window.state.plan.rules.mode == RenameMode.TRANSFORM
+        assert window._active_panel == "transform"
         assert not window.state.apply_enabled
         assert str(window._rows[tmp_path / "01.txt"].entry["state"]) == "normal"
+
+        window._rule_variables["prefix"].set("new-")
+        assert window._flush_pending_state()
+        assert [item.final_name for item in window.state.plan.items] == ["new-01.txt", "new-02.txt"]
+        window._rule_variables["prefix"].set("")
+        assert window._flush_pending_state()
 
         window._rows[tmp_path / "01.txt"].stem.set("cover")
         window._apply_action()
@@ -302,8 +332,55 @@ def test_gui_rebases_after_multiple_rounds_and_undoes_only_the_latest_run(tmp_pa
         window._undo_action()
         assert [item.source.original_name for item in window.state.plan.items] == ["01.txt", "02.txt"]
         assert window.state.last_apply_run_id is None
+        assert window.state.plan.rules.mode == RenameMode.TRANSFORM
+        assert window._active_panel == "transform"
         assert str(window._rows[tmp_path / "01.txt"].entry["state"]) == "normal"
         assert (tmp_path / "01.txt").exists()
         assert not (tmp_path / "cover.txt").exists()
+    finally:
+        window.root.destroy()
+
+
+def test_gui_keeps_exact_undo_available_when_apply_rebase_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "draft.txt"
+    source.write_text("data", encoding="utf-8")
+    window = make_window(tmp_path, [source], RenameRules(prefix="done-"))
+    original_rebase = window._rebase
+    original_undo = rename_gui.undo_rename_run
+    undo_run_ids: list[int] = []
+    rebase_calls = 0
+    try:
+        def rebase(paths: tuple[Path, ...]) -> None:
+            nonlocal rebase_calls
+            rebase_calls += 1
+            if rebase_calls == 1:
+                raise RenameError("simulated rebase failure")
+            original_rebase(paths)
+
+        def undo(database: Database, run_id: int, logger: object) -> RenameResult:
+            undo_run_ids.append(run_id)
+            return original_undo(database, run_id, logger)
+
+        monkeypatch.setattr(window, "_rebase", rebase)
+        monkeypatch.setattr(window, "_show_error", lambda *_args: None)
+        monkeypatch.setattr(rename_gui, "undo_rename_run", undo)
+
+        window._apply_action()
+
+        run_id = window.state.last_apply_run_id
+        assert run_id is not None
+        assert window.state.locked
+        assert not window.state.apply_enabled
+        assert str(window._rows[source].entry["state"]) == "disabled"
+        assert str(window._undo["state"]) == "normal"
+        assert window._undo.winfo_manager() == "pack"
+
+        window._undo_action()
+
+        assert undo_run_ids == [run_id]
+        assert not window.state.locked
+        assert (tmp_path / "draft.txt").exists()
     finally:
         window.root.destroy()

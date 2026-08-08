@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 
 from .filesystem import FilesystemSafetyError, assert_ordinary_directory, is_ordinary_file
 
@@ -77,7 +78,12 @@ def _pythonw_path() -> Path:
 
 
 def _launcher_path(*, require_exists: bool = True) -> Path:
-    path = Path(sys.executable).with_name(LAUNCHER_NAME)
+    scripts_dir = sysconfig.get_path("scripts")
+    path = (
+        Path(scripts_dir) / LAUNCHER_NAME
+        if scripts_dir
+        else Path(sys.executable).with_name(LAUNCHER_NAME)
+    )
     if require_exists and not is_ordinary_file(path):
         raise SendToError(
             "MyKr-ops Rename launcher is unavailable. "

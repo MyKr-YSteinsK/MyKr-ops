@@ -26,9 +26,27 @@ def test_launcher_path_requires_an_editable_install_when_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(sendto.sys, "executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr(sendto.sysconfig, "get_path", lambda _name: str(tmp_path / "Scripts"))
 
     with pytest.raises(sendto.SendToError, match="pip install -e"):
         sendto._launcher_path()
+
+
+def test_launcher_path_uses_the_python_installation_scripts_directory(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sendto.sys, "executable", r"C:\Python312\python.exe")
+    monkeypatch.setattr(sendto.sysconfig, "get_path", lambda _name: r"C:\Python312\Scripts")
+
+    assert sendto._launcher_path(require_exists=False) == Path(r"C:\Python312\Scripts\mykr-ops-rename.exe")
+
+
+def test_launcher_path_uses_the_venv_scripts_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scripts_dir = tmp_path / ".venv" / "Scripts"
+    monkeypatch.setattr(sendto.sys, "executable", str(scripts_dir / "python.exe"))
+    monkeypatch.setattr(sendto.sysconfig, "get_path", lambda _name: str(scripts_dir))
+
+    assert sendto._launcher_path(require_exists=False) == scripts_dir / sendto.LAUNCHER_NAME
 
 
 def test_install_updates_only_verified_owned_entry_and_verifies_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
