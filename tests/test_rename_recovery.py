@@ -42,6 +42,33 @@ def create_prepared_rename(database: Database, source: Path, temporary: Path, fi
     )
 
 
+def create_prepared_batch(
+    database: Database,
+    entries: list[tuple[Path, Path, Path]],
+    mode: str = "apply",
+    related_item_ids: list[int] | None = None,
+) -> int:
+    parent = entry_identity(entries[0][0].parent)
+    items: list[dict[str, object]] = []
+    for index, (source, temporary, final) in enumerate(entries, start=1):
+        identity = entry_identity(source)
+        items.append(
+            {
+                "sequence_index": index,
+                "object_kind": identity.kind,
+                "original_path": source,
+                "temporary_path": temporary,
+                "final_path": final,
+                "volume_serial": identity.volume_serial,
+                "file_index": identity.file_index,
+                "parent_volume_serial": parent.volume_serial,
+                "parent_file_index": parent.file_index,
+                "related_item_id": related_item_ids[index - 1] if related_item_ids is not None else None,
+            }
+        )
+    return database.create_rename_run(mode, items)
+
+
 def test_recovery_rolls_interrupted_staged_rename_back_to_original(tmp_path: Path) -> None:
     source = tmp_path / "draft.txt"
     temporary = tmp_path / ".mykr-ops-rename-interrupted"
@@ -97,6 +124,101 @@ def test_recovery_finishes_an_all_success_run_interrupted_before_run_finalizatio
     assert database.get_run(run_id)["status"] == "success"  # type: ignore[index]
 
 
+def test_recovery_rolls_back_a_partially_finalized_swap_as_one_batch(tmp_path: Path) -> None:
+    first = tmp_path / "A.txt"
+    second = tmp_path / "B.txt"
+    temp_first = tmp_path / ".tmp-A"
+    temp_second = tmp_path / ".tmp-B"
+    first.write_text("A", encoding="utf-8")
+    second.write_text("B", encoding="utf-8")
+    database = make_database(tmp_path)
+    run_id = create_prepared_batch(database, [(first, temp_first, second), (second, temp_second, first)])
+    first_identity = entry_identity(first)
+    second_identity = entry_identity(second)
+    rename_entry_without_overwrite(first, temp_first, first_identity)
+    rename_entry_without_overwrite(second, temp_second, second_identity)
+    rename_entry_without_overwrite(temp_first, second, first_identity)
+
+    recover_rename_operations(database)
+
+    assert first.read_text(encoding="utf-8") == "A"
+    assert second.read_text(encoding="utf-8") == "B"
+    assert not temp_first.exists()
+    assert not temp_second.exists()
+    assert {row["state"] for row in database.rename_items_for_run(run_id)} == {"rolled_back"}
+    assert database.get_run(run_id)["status"] == "failed"  # type: ignore[index]
+
+
+def test_recovery_rolls_back_a_partially_finalized_three_cycle_as_one_batch(tmp_path: Path) -> None:
+    first = tmp_path / "A.txt"
+    second = tmp_path / "B.txt"
+    third = tmp_path / "C.txt"
+    temp_first = tmp_path / ".tmp-A"
+    temp_second = tmp_path / ".tmp-B"
+    temp_third = tmp_path / ".tmp-C"
+    for path, content in ((first, "A"), (second, "B"), (third, "C")):
+        path.write_text(content, encoding="utf-8")
+    database = make_database(tmp_path)
+    run_id = create_prepared_batch(
+        database,
+        [(first, temp_first, second), (second, temp_second, third), (third, temp_third, first)],
+    )
+    identities = {path: entry_identity(path) for path in (first, second, third)}
+    rename_entry_without_overwrite(first, temp_first, identities[first])
+    rename_entry_without_overwrite(second, temp_second, identities[second])
+    rename_entry_without_overwrite(third, temp_third, identities[third])
+    rename_entry_without_overwrite(temp_first, second, identities[first])
+    rename_entry_without_overwrite(temp_second, third, identities[second])
+
+    recover_rename_operations(database)
+
+    assert [path.read_text(encoding="utf-8") for path in (first, second, third)] == ["A", "B", "C"]
+    assert not any(path.exists() for path in (temp_first, temp_second, temp_third))
+    assert {row["state"] for row in database.rename_items_for_run(run_id)} == {"rolled_back"}
+
+
+def test_recovery_finishes_a_completed_swap_without_rolling_it_back(tmp_path: Path) -> None:
+    first = tmp_path / "A.txt"
+    second = tmp_path / "B.txt"
+    temp_first = tmp_path / ".tmp-A"
+    temp_second = tmp_path / ".tmp-B"
+    first.write_text("A", encoding="utf-8")
+    second.write_text("B", encoding="utf-8")
+    database = make_database(tmp_path)
+    run_id = create_prepared_batch(database, [(first, temp_first, second), (second, temp_second, first)])
+    first_identity = entry_identity(first)
+    second_identity = entry_identity(second)
+    rename_entry_without_overwrite(first, temp_first, first_identity)
+    rename_entry_without_overwrite(second, temp_second, second_identity)
+    rename_entry_without_overwrite(temp_first, second, first_identity)
+    rename_entry_without_overwrite(temp_second, first, second_identity)
+    for row in database.rename_items_for_run(run_id):
+        database.update_rename_item_state(int(row["id"]), "success")
+
+    recover_rename_operations(database)
+
+    assert first.read_text(encoding="utf-8") == "B"
+    assert second.read_text(encoding="utf-8") == "A"
+    assert database.get_run(run_id)["status"] == "success"  # type: ignore[index]
+
+
+def test_recovery_rejects_an_unknown_occupant_at_a_recorded_batch_location(tmp_path: Path) -> None:
+    source = tmp_path / "A.txt"
+    temporary = tmp_path / ".tmp-A"
+    final = tmp_path / "B.txt"
+    source.write_text("A", encoding="utf-8")
+    database = make_database(tmp_path)
+    run_id = create_prepared_rename(database, source, temporary, final)
+    identity = entry_identity(source)
+    rename_entry_without_overwrite(source, temporary, identity)
+    final.write_text("external", encoding="utf-8")
+
+    with pytest.raises(RenameRecoveryRequired, match="unrelated"):
+        recover_rename_operations(database)
+
+    assert database.rename_items_for_run(run_id)[0]["state"] == "recovery_required"
+
+
 def test_recovery_finalizes_interrupted_successful_undo_links(tmp_path: Path) -> None:
     source = tmp_path / "draft.txt"
     source.write_text("data", encoding="utf-8")
@@ -133,6 +255,47 @@ def test_recovery_finalizes_interrupted_successful_undo_links(tmp_path: Path) ->
     assert source.read_text(encoding="utf-8") == "data"
     assert database.get_run(undo_run)["status"] == "success"  # type: ignore[index]
     assert database.rename_items_for_run(apply_result.run_id or 0)[0]["undone_at"]
+
+
+def test_recovery_rolls_back_a_partially_finalized_undo_swap_as_one_batch(tmp_path: Path) -> None:
+    first = tmp_path / "A.txt"
+    second = tmp_path / "B.txt"
+    first.write_text("A", encoding="utf-8")
+    second.write_text("B", encoding="utf-8")
+    database = make_database(tmp_path)
+    apply_plan = build_rename_plan([first, second])
+    apply_plan.set_manual_stem(0, "B")
+    apply_plan.set_manual_stem(1, "A")
+    applied = apply_rename(apply_plan, database)
+    apply_rows = database.rename_items_for_run(applied.run_id or 0)
+    undo_entries: list[tuple[Path, Path, Path]] = []
+    for row in apply_rows:
+        undo_entries.append((Path(row["final_path"]), tmp_path / f".undo-{row['id']}", Path(row["original_path"])))
+    undo_run = create_prepared_batch(
+        database,
+        undo_entries,
+        mode="undo",
+        related_item_ids=[int(row["id"]) for row in apply_rows],
+    )
+    first_undo, second_undo = database.rename_items_for_run(undo_run)
+    first_identity = entry_identity(Path(first_undo["original_path"]))
+    second_identity = entry_identity(Path(second_undo["original_path"]))
+    rename_entry_without_overwrite(
+        Path(first_undo["original_path"]), Path(first_undo["temporary_path"]), first_identity
+    )
+    rename_entry_without_overwrite(
+        Path(second_undo["original_path"]), Path(second_undo["temporary_path"]), second_identity
+    )
+    rename_entry_without_overwrite(
+        Path(first_undo["temporary_path"]), Path(first_undo["final_path"]), first_identity
+    )
+
+    recover_rename_operations(database)
+
+    assert first.read_text(encoding="utf-8") == "B"
+    assert second.read_text(encoding="utf-8") == "A"
+    assert database.get_run(undo_run)["status"] == "failed"  # type: ignore[index]
+    assert all(row["undone_at"] is None for row in database.rename_items_for_run(applied.run_id or 0))
 
 
 def test_rename_mutation_stops_when_notes_recovery_is_unresolved(tmp_path: Path) -> None:

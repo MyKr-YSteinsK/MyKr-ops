@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 
 from mykr_ops.database import Database
-from mykr_ops.rename import RenameError, RenameRules, apply_rename, build_rename_plan, undo_latest_rename
+from mykr_ops.rename import (
+    RenameError,
+    RenameRules,
+    apply_rename,
+    build_rename_plan,
+    undo_latest_rename,
+    undo_rename_run,
+)
 
 
 def make_database(tmp_path: Path) -> Database:
@@ -62,3 +69,53 @@ def test_undo_precheck_does_not_overwrite_recreated_original_name(tmp_path: Path
         undo_latest_rename(database)
     assert source.read_text(encoding="utf-8") == "new user file"
     assert (tmp_path / "done-draft.txt").read_text(encoding="utf-8") == "original"
+
+
+def test_run_specific_undo_never_substitutes_a_newer_rename_batch(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    database = make_database(tmp_path)
+    run_a = apply_rename(build_rename_plan([first], RenameRules(prefix="old-")), database)
+    run_b = apply_rename(build_rename_plan([second], RenameRules(prefix="new-")), database)
+
+    restored = undo_rename_run(database, run_a.run_id or 0)
+
+    assert not restored.failed
+    assert first.read_text(encoding="utf-8") == "first"
+    assert (tmp_path / "new-second.txt").read_text(encoding="utf-8") == "second"
+    assert database.rename_items_for_run(run_b.run_id or 0)[0]["undone_at"] is None
+
+
+def test_run_specific_undo_rejects_an_already_undone_or_wrong_type_run(tmp_path: Path) -> None:
+    source = tmp_path / "draft.txt"
+    source.write_text("data", encoding="utf-8")
+    database = make_database(tmp_path)
+    applied = apply_rename(build_rename_plan([source], RenameRules(prefix="done-")), database)
+    undo_rename_run(database, applied.run_id or 0)
+
+    with pytest.raises(RenameError, match="no longer eligible"):
+        undo_rename_run(database, applied.run_id or 0)
+
+    notes_run_id = database.create_run("notes", "apply")
+    with pytest.raises(RenameError, match="not a successful rename apply"):
+        undo_rename_run(database, notes_run_id)
+
+
+def test_run_specific_undo_refuses_when_a_newer_batch_occupies_its_original_name(tmp_path: Path) -> None:
+    source = tmp_path / "draft.txt"
+    other = tmp_path / "other.txt"
+    source.write_text("A", encoding="utf-8")
+    other.write_text("B", encoding="utf-8")
+    database = make_database(tmp_path)
+    run_a = apply_rename(build_rename_plan([source], RenameRules(prefix="done-")), database)
+    run_b_plan = build_rename_plan([other])
+    run_b_plan.set_manual_stem(0, "draft")
+    run_b = apply_rename(run_b_plan, database)
+
+    with pytest.raises(RenameError, match="occupied"):
+        undo_rename_run(database, run_a.run_id or 0)
+    assert (tmp_path / "draft.txt").read_text(encoding="utf-8") == "B"
+    assert (tmp_path / "done-draft.txt").read_text(encoding="utf-8") == "A"
+    assert database.rename_items_for_run(run_b.run_id or 0)[0]["undone_at"] is None

@@ -356,29 +356,61 @@ def _row_path(row: object, field: str) -> Path:
     return Path(value)
 
 
-def _row_location(row: object) -> tuple[str, Path]:
-    expected = _item_identity(row)
-    candidates: list[tuple[str, Path]] = [
-        ("original", _row_path(row, "original_path")),
-        ("temporary", _row_path(row, "temporary_path")),
-        ("final", _row_path(row, "final_path")),
-    ]
-    if row["rollback_path"]:
-        candidates.append(("rollback", Path(row["rollback_path"])))
-    found: list[tuple[str, Path]] = []
-    for label, path in candidates:
-        if not path_exists_no_follow(path):
-            continue
+def inspect_rename_batch_locations(
+    rows: list[object], parent_path: Path, verified_parent: VerifiedDirectoryRoot | None = None
+) -> dict[int, Path]:
+    """Map every recorded object to its one current path within a rename batch.
+
+    A swap or cycle can legitimately put one batch object at another item's
+    original or final path. Only an object outside the durable batch, a missing
+    object, or one object at multiple distinct paths is ambiguous.
+    """
+    _assert_recovery_parent(rows, parent_path, verified_parent)
+    identities: dict[EntryIdentity, object] = {}
+    candidate_names: list[str] = []
+    for row in rows:
+        identity = _item_identity(row)
+        if identity in identities:
+            raise RenameRecoveryRequired("rename run records the same object more than once")
+        identities[identity] = row
+        for field in ("original_path", "temporary_path", "final_path", "rollback_path"):
+            value = row[field]
+            if value is None:
+                continue
+            path = Path(value)
+            if path.parent != parent_path:
+                raise RenameRecoveryRequired("rename run has a location outside its recorded parent directory")
+            if not any(names_equal(path.name, name) for name in candidate_names):
+                candidate_names.append(path.name)
+
+    locations: dict[EntryIdentity, Path] = {}
+    for name in candidate_names:
         try:
-            actual = entry_identity(path)
+            matches = direct_casefold_matches(parent_path, name)
         except FilesystemSafetyError as exc:
-            raise RenameRecoveryRequired(f"could not inspect rename item {row['id']}: {exc}") from exc
-        if actual != expected:
-            raise RenameRecoveryRequired(f"rename item {row['id']} path was replaced: {path}")
-        found.append((label, path))
-    if len(found) != 1:
-        raise RenameRecoveryRequired(f"rename item {row['id']} has ambiguous filesystem locations")
-    return found[0]
+            raise RenameRecoveryRequired(f"could not inspect rename batch location {name}: {exc}") from exc
+        if len(matches) > 1:
+            raise RenameRecoveryRequired(f"rename batch location is case-insensitively ambiguous: {name}")
+        if not matches:
+            continue
+        path = matches[0]
+        try:
+            identity = entry_identity(path)
+        except FilesystemSafetyError as exc:
+            raise RenameRecoveryRequired(f"could not inspect rename batch location {path}: {exc}") from exc
+        if identity not in identities:
+            raise RenameRecoveryRequired(f"rename batch location is occupied by an unrelated object: {path}")
+        previous = locations.get(identity)
+        if previous is not None and not names_equal(previous.name, path.name):
+            raise RenameRecoveryRequired(
+                f"rename item {identities[identity]['id']} has multiple filesystem locations (ambiguous)"
+            )
+        locations[identity] = path
+
+    missing = [row for identity, row in identities.items() if identity not in locations]
+    if missing:
+        raise RenameRecoveryRequired(f"rename item {missing[0]['id']} is missing from every recorded location")
+    return {int(row["id"]): locations[_item_identity(row)] for row in rows}
 
 
 def _rename_row(row: object, source: Path, destination: Path, parent: VerifiedDirectoryRoot | None) -> None:
@@ -388,7 +420,7 @@ def _rename_row(row: object, source: Path, destination: Path, parent: VerifiedDi
 def _mark_recovery_required(database: Database, rows: Iterable[object], reason: str) -> int | None:
     first_id: int | None = None
     for row in rows:
-        if row["state"] in {"success", "rolled_back", "failed"}:
+        if row["state"] in {"rolled_back", "failed"}:
             continue
         try:
             database.update_rename_item_state(int(row["id"]), "recovery_required", reason, "recovery_ambiguous")
@@ -400,17 +432,11 @@ def _mark_recovery_required(database: Database, rows: Iterable[object], reason: 
 
 
 def _rollback_rows(database: Database, rows: list[object], parent: VerifiedDirectoryRoot | None) -> None:
-    _assert_recovery_parent(rows, Path(rows[0]["original_path"]).parent, parent)
-    current: list[tuple[object, Path]] = []
-    for row in rows:
-        location, path = _row_location(row)
-        if location == "original":
-            database.update_rename_item_state(int(row["id"]), "rolled_back", "rollback confirmed original path")
-        else:
-            current.append((row, path))
-    if not current:
-        return
-    rollback_paths = _unique_rollback_paths(Path(rows[0]["original_path"]).parent, current)
+    parent_path = Path(rows[0]["original_path"]).parent
+    _assert_recovery_parent(rows, parent_path, parent)
+    current_locations = inspect_rename_batch_locations(rows, parent_path, parent)
+    current = [(row, current_locations[int(row["id"])]) for row in rows]
+    rollback_paths = _unique_rollback_paths(parent_path, current)
     for row, path in current:
         rollback_path = rollback_paths[int(row["id"])]
         database.update_rename_item_state(
@@ -423,6 +449,14 @@ def _rollback_rows(database: Database, rows: list[object], parent: VerifiedDirec
         database.update_rename_item_state(int(row["id"]), "rollback_finalize_prepared")
         _rename_row(row, rollback_path, _row_path(row, "original_path"), parent)
         database.update_rename_item_state(int(row["id"]), "rolled_back", "batch rollback completed")
+    restored = inspect_rename_batch_locations(
+        database.rename_items_for_run(int(rows[0]["run_id"])), parent_path, parent
+    )
+    for row in rows:
+        location = restored[int(row["id"])]
+        original = _row_path(row, "original_path")
+        if location.name != original.name:
+            raise RenameRecoveryRequired(f"rename rollback did not restore item {row['id']} to its original name")
 
 
 def _unique_rollback_paths(parent: Path, current: list[tuple[object, Path]]) -> dict[int, Path]:
@@ -448,8 +482,9 @@ def _assert_recovery_parent(
     expected_volume = int(rows[0]["parent_volume_serial"])
     expected_file = int(rows[0]["parent_file_index"])
     for row in rows:
-        if Path(row["original_path"]).parent != parent_path:
-            raise RenameRecoveryRequired("rename run has entries from different parent directories")
+        for field in ("original_path", "temporary_path", "final_path", "rollback_path"):
+            if row[field] is not None and Path(row[field]).parent != parent_path:
+                raise RenameRecoveryRequired("rename run has entries from different parent directories")
         if (
             int(row["parent_volume_serial"]) != expected_volume
             or int(row["parent_file_index"]) != expected_file
@@ -476,10 +511,11 @@ def _finalize_completed_run(database: Database, run: object, rows: list[object])
     if not rows or any(row["state"] != "success" for row in rows):
         return False
     parent = Path(rows[0]["original_path"]).parent
-    _assert_recovery_parent(rows, parent, None)
+    locations = inspect_rename_batch_locations(rows, parent)
     for row in rows:
-        location, _ = _row_location(row)
-        if location != "final":
+        location = locations[int(row["id"])]
+        final = _row_path(row, "final_path")
+        if location.name != final.name:
             raise RenameRecoveryRequired(
                 f"rename run {run['id']} was marked successful but item {row['id']} is not at its final path"
             )
@@ -684,7 +720,39 @@ def undo_latest_rename(
     apply_run = database.latest_eligible_rename_apply_run()
     if apply_run is None:
         return RenameResult(None, 0, 0, False, "No eligible rename batch to undo.")
-    apply_items = database.successful_rename_items_for_run(int(apply_run["id"]))
+    return undo_rename_run(database, int(apply_run["id"]), logger, lock_held=True)
+
+
+def undo_rename_run(
+    database: Database,
+    apply_run_id: int,
+    logger: logging.Logger | None = None,
+    *,
+    lock_held: bool = False,
+) -> RenameResult:
+    """Undo one exact successful rename apply run; never substitute a newer run."""
+    if not lock_held:
+        with database.mutation_lock():
+            return undo_rename_run(database, apply_run_id, logger, lock_held=True)
+    database.initialize()
+    if database.prepared_or_recovery_operations():
+        raise MutationBlockedError("notes recovery must be resolved before a rename mutation")
+    recover_rename_operations(database, logger)
+    apply_run = database.get_run(apply_run_id)
+    if apply_run is None:
+        raise RenameError(f"rename apply run {apply_run_id} does not exist")
+    if (
+        apply_run["command"] != "rename"
+        or apply_run["mode"] != "apply"
+        or apply_run["status"] != "success"
+    ):
+        raise RenameError(f"run {apply_run_id} is not a successful rename apply run")
+    recorded_items = database.rename_items_for_run(apply_run_id)
+    if not recorded_items or any(item["state"] != "success" or item["undone_at"] is not None for item in recorded_items):
+        raise RenameError(f"rename apply run {apply_run_id} is no longer eligible for undo")
+    apply_items = database.successful_rename_items_for_run(apply_run_id)
+    if len(apply_items) != len(recorded_items):
+        raise RenameError(f"rename apply run {apply_run_id} is no longer eligible for undo")
     plan, related = _undo_plan(apply_items)
     result = _execute_plan(plan, database, mode="undo", related=related, logger=logger)
     if not result.failed:

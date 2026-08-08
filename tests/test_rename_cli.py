@@ -1,12 +1,54 @@
 from __future__ import annotations
 
 from pathlib import Path
+import runpy
+import subprocess
+import sys
 
 import pytest
 
 from mykr_ops import cli, rename_gui
 from mykr_ops.database import Database
 from mykr_ops.filesystem import entry_identity
+
+
+def test_module_execution_exposes_the_cli_help() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "mykr_ops", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert completed.returncode == 0
+    assert "MyKr-ops local automation toolkit" in completed.stdout
+
+
+def test_module_entry_routes_sendto_style_gui_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "draft.txt"
+    source.write_text("data", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(cli, "application_data_dir", lambda *, create: state_dir)
+    monkeypatch.setattr(cli, "_configure_logger", lambda _state_dir: object())
+
+    def launch(paths: list[Path], database: Database, logger: object) -> None:
+        seen["paths"] = paths
+        seen["database"] = database.path
+
+    monkeypatch.setattr(rename_gui, "launch_rename_gui", launch)
+    # This is the argv seen after Python has consumed the Send To target's
+    # `-m mykr_ops` module selector.
+    monkeypatch.setattr(sys, "argv", ["mykr_ops", "rename", "gui", str(source)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_module("mykr_ops", run_name="__main__")
+
+    assert exc_info.value.code == 0
+    assert seen == {"paths": [source], "database": state_dir / "mykr-ops.db"}
 
 
 def test_rename_gui_requires_explicit_path() -> None:
