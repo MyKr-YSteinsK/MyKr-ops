@@ -60,6 +60,9 @@ class RenameGuiState:
     def restore_automatic(self, index: int) -> None:
         self.plan.restore_automatic(index)
 
+    def clear_manual_overrides(self) -> None:
+        self.plan.clear_manual_overrides()
+
     def restore_order(self) -> None:
         self.plan.restore_initial_order()
 
@@ -115,6 +118,7 @@ class _RenameWindow:
         self._rows: dict[Path, _RenameRowView] = {}
         self._rendering = False
         self._rules_after_id: str | None = None
+        self._last_input_error: str | None = None
         self._drag_source: Path | None = None
         self._drag_target: int | None = None
         self._active_panel = "find"
@@ -157,6 +161,13 @@ class _RenameWindow:
         self._tab_host.pack(fill="x")
         for text, panel in (("Find / replace", "find"), ("Prefix / suffix", "affix"), ("Numbering", "number"), ("Order", "order")):
             self.ttk.Button(self._tab_host, text=text, style="MyKr.Tab.TButton", command=lambda value=panel: self._show_panel(value)).pack(side="left", padx=(0, 6))
+        self._reset_manual = self.ttk.Button(
+            self._tab_host,
+            text="Reset manual edits",
+            style="MyKr.TButton",
+            command=self._reset_manual_edits,
+        )
+        self._reset_manual.pack(side="right")
         self._panel_host = self.tk.Frame(tools, background=self._SURFACE, height=0)
         self._panel_host.pack(fill="x", pady=(5, 8))
         self._panel_host.pack_propagate(False)
@@ -344,23 +355,25 @@ class _RenameWindow:
             self.root.after_cancel(view.debounce_id)
         view.debounce_id = self.root.after(100, lambda path=source_path: self._commit_manual(path))
 
-    def _commit_manual(self, source_path: Path) -> None:
+    def _commit_manual(self, source_path: Path) -> bool:
         view = self._rows.get(source_path)
         if view is None:
-            return
+            return True
         view.debounce_id = None
         index = self._item_index(source_path)
         item = self.state.plan.items[index]
         if not item.is_manual and view.stem.get() == item.automatic_stem:
             self._update_rows(active_source=source_path)
-            return
+            return True
         try:
             self.state.set_manual_stem(index, view.stem.get())
         except RenameError as exc:
-            self._summary.configure(text=f"Input error: {exc}")
+            self._last_input_error = f"Input error: {exc}"
+            self._summary.configure(text=self._last_input_error)
             self._apply.configure(state="disabled")
-            return
+            return False
         self._update_rows(active_source=source_path)
+        return True
 
     def _commit_and_move(self, source_path: Path, delta: int, _event: Any) -> str:
         view = self._rows[source_path]
@@ -395,6 +408,23 @@ class _RenameWindow:
         self.state.restore_automatic(self._item_index(source_path))
         self._update_rows()
 
+    def _reset_manual_edits(self) -> None:
+        if self.state.completed:
+            return
+        for view in self._rows.values():
+            if view.debounce_id is not None:
+                self.root.after_cancel(view.debounce_id)
+                view.debounce_id = None
+        if self._rules_after_id is not None:
+            self.root.after_cancel(self._rules_after_id)
+            self._rules_after_id = None
+        rules_valid = self._commit_rules()
+        self.state.clear_manual_overrides()
+        self._update_rows()
+        if not rules_valid:
+            self._summary.configure(text=self._last_input_error or "Input error: rename settings are invalid")
+            self._apply.configure(state="disabled")
+
     def _schedule_rule_update(self, *_: object) -> None:
         if self._rendering or self.state.completed:
             return
@@ -402,7 +432,7 @@ class _RenameWindow:
             self.root.after_cancel(self._rules_after_id)
         self._rules_after_id = self.root.after(100, self._commit_rules)
 
-    def _commit_rules(self) -> None:
+    def _commit_rules(self) -> bool:
         self._rules_after_id = None
         try:
             self.state.update_rules(
@@ -416,10 +446,32 @@ class _RenameWindow:
                 numbering_separator=self._rule_variables["numbering_separator"].get(),
             )
         except (ValueError, RenameError) as exc:
-            self._summary.configure(text=f"Input error: {exc}")
+            self._last_input_error = f"Input error: {exc}"
+            self._summary.configure(text=self._last_input_error)
             self._apply.configure(state="disabled")
-            return
+            return False
+        self._last_input_error = None
         self._update_rows()
+        return True
+
+    def _flush_pending_state(self) -> bool:
+        if self._rules_after_id is not None:
+            self.root.after_cancel(self._rules_after_id)
+            self._rules_after_id = None
+        valid = self._commit_rules()
+        for source_path, view in self._rows.items():
+            if view.debounce_id is None:
+                continue
+            self.root.after_cancel(view.debounce_id)
+            view.debounce_id = None
+            valid = self._commit_manual(source_path) and valid
+        if not valid:
+            self._summary.configure(text=self._last_input_error or "Input error: rename settings are invalid")
+            self._apply.configure(state="disabled")
+            return False
+        self.state.plan.recompute()
+        self._update_rows()
+        return self.state.apply_enabled
 
     def _update_rows(self, active_source: Path | None = None) -> None:
         self._rendering = True
@@ -442,6 +494,8 @@ class _RenameWindow:
             self._summary.configure(text=self.state.summary)
             changed = len(self.state.plan.changed_items)
             self._apply.configure(text=f"Confirm rename {changed} item(s)", state="normal" if self.state.apply_enabled else "disabled")
+            has_manual = any(item.is_manual for item in self.state.plan.items)
+            self._reset_manual.configure(state="normal" if has_manual and not self.state.completed else "disabled")
         finally:
             self._rendering = False
 
@@ -494,6 +548,8 @@ class _RenameWindow:
             self._rebuild_rows()
 
     def _apply_action(self) -> None:
+        if not self._flush_pending_state():
+            return
         self._apply.configure(state="disabled", text="Applying…")
         self.root.update_idletasks()
         try:
