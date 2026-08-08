@@ -31,6 +31,15 @@ class VerifiedDirectoryRoot:
     final_path: str
 
 
+@dataclass(frozen=True)
+class EntryIdentity:
+    """Stable identity for one ordinary direct-child filesystem entry."""
+
+    kind: str
+    volume_serial: int
+    file_index: int
+
+
 def path_exists_no_follow(path: Path) -> bool:
     return os.path.lexists(path)
 
@@ -220,6 +229,89 @@ def snapshot_matches(path: Path, expected_size: int, expected_mtime_ns: int, exp
         raise FilesystemSafetyError(
             f"source content changed after planning: {path}", error_type="source_changed"
         )
+
+
+def entry_identity(path: Path) -> EntryIdentity:
+    """Return the stable identity of an ordinary file or directory without hashing it."""
+    if is_ordinary_file(path):
+        kind = "file"
+    elif is_ordinary_directory(path):
+        kind = "directory"
+    else:
+        raise FilesystemSafetyError(
+            f"path is not an ordinary file or directory: {path}", error_type="source_missing"
+        )
+    if os.name != "nt":
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise FilesystemSafetyError(f"could not inspect {path}: {exc}") from exc
+        return EntryIdentity(kind, int(metadata.st_dev), int(metadata.st_ino))
+
+    handle = _open_rename_entry_handle(path, kind)
+    try:
+        identity = _handle_identity(handle, f"rename source {path}")
+        return EntryIdentity(kind, identity[0], identity[1])
+    finally:
+        _close_handle(handle)
+
+
+def rename_entry_without_overwrite(
+    source: Path,
+    destination: Path,
+    expected_identity: EntryIdentity,
+    *,
+    verified_parent: VerifiedDirectoryRoot | None = None,
+) -> None:
+    """Rename one ordinary direct child without replacing any existing entry.
+
+    The Windows path keeps a source handle and its verified parent handle open
+    throughout the rename. The portable fallback exists only for isolated tests.
+    """
+    if source.parent != destination.parent:
+        raise FilesystemSafetyError(
+            f"rename must remain in one parent directory: {source} -> {destination}",
+            error_type="path_escape",
+        )
+    if destination.name in {"", ".", ".."} or Path(destination.name).name != destination.name:
+        raise FilesystemSafetyError(
+            f"destination must be a simple relative filename: {destination}",
+            error_type="path_escape",
+        )
+    assert_ordinary_directory(source.parent, f"rename parent {source.parent}")
+    if entry_identity(source) != expected_identity:
+        raise FilesystemSafetyError(
+            f"rename source identity changed: {source}", error_type="source_changed"
+        )
+    matches = direct_casefold_matches(source.parent, destination.name)
+    if matches and not (
+        len(matches) == 1
+        and matches[0].name == source.name
+        and destination.name != source.name
+        and entry_identity(matches[0]) == expected_identity
+    ):
+        raise FilesystemSafetyError(
+            f"destination already exists: {matches[0]}", error_type="destination_exists"
+        )
+    if os.name == "nt":
+        _rename_entry_windows(source, destination, expected_identity, verified_parent)
+        return
+    _rename_entry_portably(source, destination, expected_identity)
+
+
+def _rename_entry_portably(
+    source: Path, destination: Path, expected_identity: EntryIdentity
+) -> None:
+    """Portable no-overwrite approximation used only by temporary-directory tests."""
+    if path_exists_no_follow(destination) and destination.name != source.name:
+        raise FilesystemSafetyError(
+            f"destination already exists: {destination}", error_type="destination_exists"
+        )
+    try:
+        source.rename(destination)
+    except OSError as exc:
+        raise FilesystemSafetyError(f"could not rename {source}: {exc}") from exc
+    _verify_renamed_entry(source, destination, expected_identity)
 
 
 def move_file_without_overwrite(
@@ -529,6 +621,110 @@ def _open_directory_handle(path: Path) -> int:
     return handle
 
 
+def _open_rename_entry_handle(path: Path, expected_kind: str) -> int:
+    handle = _create_file(
+        str(path), _DELETE | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE, _FILE_SHARE_READ,
+        None, _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        _raise_windows_error(f"could not safely open rename source {path}")
+    try:
+        if _get_file_type(handle) != _FILE_TYPE_DISK:
+            raise FilesystemSafetyError(f"rename source is not a regular disk entry: {path}")
+        identity = _handle_identity(handle, f"rename source {path}")
+        is_directory = bool(identity[4] & _FILE_ATTRIBUTE_DIRECTORY)
+        if identity[4] & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise FilesystemSafetyError(
+                f"rename source is a symbolic link, junction, or reparse point: {path}",
+                error_type="unsafe_reparse_point",
+            )
+        if (expected_kind == "directory") != is_directory:
+            raise FilesystemSafetyError(f"rename source kind changed: {path}", error_type="source_changed")
+        return handle
+    except BaseException:
+        _close_handle(handle)
+        raise
+
+
+def _open_entry_identity_handle(path: Path, expected_kind: str) -> int:
+    handle = _create_file(
+        str(path), _FILE_READ_ATTRIBUTES | _SYNCHRONIZE, _FILE_SHARE_READ,
+        None, _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        _raise_windows_error(f"could not safely inspect renamed entry {path}")
+    try:
+        identity = _handle_identity(handle, f"renamed entry {path}")
+        is_directory = bool(identity[4] & _FILE_ATTRIBUTE_DIRECTORY)
+        if identity[4] & FILE_ATTRIBUTE_REPARSE_POINT or (expected_kind == "directory") != is_directory:
+            raise FilesystemSafetyError(f"renamed entry verification failed: {path}")
+        return handle
+    except BaseException:
+        _close_handle(handle)
+        raise
+
+
+def _rename_entry_windows(
+    source: Path,
+    destination: Path,
+    expected_identity: EntryIdentity,
+    verified_parent: VerifiedDirectoryRoot | None,
+) -> None:
+    source_handle = _open_rename_entry_handle(source, expected_identity.kind)
+    parent_handle = verified_parent.handle if verified_parent is not None else _open_directory_handle(source.parent)
+    owns_parent_handle = verified_parent is None
+    try:
+        source_identity = _handle_identity(source_handle, f"rename source {source}")
+        if (source_identity[0], source_identity[1]) != (
+            expected_identity.volume_serial,
+            expected_identity.file_index,
+        ):
+            raise FilesystemSafetyError(
+                f"rename source identity changed: {source}", error_type="source_changed"
+            )
+        parent_identity = _handle_identity(parent_handle, f"rename parent {source.parent}")
+        if verified_parent is not None:
+            if parent_identity[:2] != verified_parent.identity[:2]:
+                raise FilesystemSafetyError(
+                    f"rename parent identity changed: {source.parent}", error_type="unsafe_reparse_point"
+                )
+            if not _final_path_is_direct_child(
+                _final_path_from_handle(source_handle, f"rename source {source}"),
+                verified_parent.final_path,
+                source.name,
+            ):
+                raise FilesystemSafetyError(
+                    f"rename source is no longer a direct child of its verified parent: {source}",
+                    error_type="path_escape",
+                )
+        if direct_casefold_matches(source.parent, destination.name) and destination.name != source.name:
+            matches = direct_casefold_matches(source.parent, destination.name)
+            if not (
+                len(matches) == 1
+                and matches[0].name == source.name
+                and (source_identity[0], source_identity[1])
+                == (expected_identity.volume_serial, expected_identity.file_index)
+            ):
+                raise FilesystemSafetyError(
+                    f"destination already exists: {matches[0]}", error_type="destination_exists"
+                )
+
+        _rename_handle_without_overwrite(source_handle, parent_handle, destination)
+
+        if _handle_identity(parent_handle, f"rename parent {source.parent}")[:2] != parent_identity[:2]:
+            raise FilesystemSafetyError(
+                f"rename parent identity changed during rename: {source.parent}",
+                error_type="unsafe_reparse_point",
+            )
+        _verify_renamed_entry(source, destination, expected_identity, source_handle=source_handle)
+    finally:
+        if owns_parent_handle:
+            _close_handle(parent_handle)
+        _close_handle(source_handle)
+
+
 @contextmanager
 def open_verified_directory_root(path: Path, description: str) -> Iterator[VerifiedDirectoryRoot | None]:
     """Retain one verified directory object while a mutation uses its descendants."""
@@ -683,6 +879,34 @@ def _hash_handle(handle: int, description: str) -> str:
         if read_count.value == 0:
             return digest.hexdigest()
         digest.update(buffer.raw[:read_count.value])
+
+
+def _verify_renamed_entry(
+    source: Path,
+    destination: Path,
+    expected_identity: EntryIdentity,
+    *,
+    source_handle: int | None = None,
+) -> None:
+    source_matches = direct_casefold_matches(source.parent, source.name)
+    if any(match.name == source.name for match in source_matches):
+        raise FilesystemSafetyError(f"source still exists after rename: {source}")
+    destination_matches = direct_casefold_matches(destination.parent, destination.name)
+    if len(destination_matches) != 1 or destination_matches[0].name != destination.name:
+        raise FilesystemSafetyError(f"destination verification failed: {destination}")
+    if source_handle is not None and os.name == "nt":
+        destination_handle = _open_entry_identity_handle(destination_matches[0], expected_identity.kind)
+        try:
+            destination_identity = _handle_identity(destination_handle, f"renamed destination {destination}")
+        finally:
+            _close_handle(destination_handle)
+        actual_identity = EntryIdentity(
+            expected_identity.kind, destination_identity[0], destination_identity[1]
+        )
+    else:
+        actual_identity = entry_identity(destination_matches[0])
+    if actual_identity != expected_identity:
+        raise FilesystemSafetyError(f"destination identity verification failed: {destination}")
 
 
 def _rename_handle_without_overwrite(source_handle: int, parent_handle: int, destination: Path) -> None:

@@ -754,6 +754,7 @@ def apply_notes(
             return apply_notes(config, database, logger, lock_held=True)
 
     recover_interrupted_operations(config, database, logger)
+    database.raise_if_unresolved_rename()
     with (
         open_verified_directory_root(config.source_dir, "source directory") as source_root,
         open_verified_directory_root(config.study_root, "study root") as destination_root,
@@ -961,6 +962,7 @@ def undo_latest(
             return undo_latest(config, database, logger, lock_held=True)
 
     recover_interrupted_operations(config, database, logger)
+    database.raise_if_unresolved_rename()
     apply_run = database.latest_eligible_apply_run()
     if apply_run is None:
         return UndoResult(None, None, [], 0, 0, 0, "No eligible apply run to undo.")

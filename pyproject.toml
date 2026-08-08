@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mykr-ops"
 version = "0.1.0"
-description = "MyKr-ops is a deterministic, local Windows study-note organizer."
+description = "MyKr-ops is a deterministic, local-first Windows automation toolkit."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

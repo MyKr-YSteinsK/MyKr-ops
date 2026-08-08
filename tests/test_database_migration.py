@@ -134,6 +134,15 @@ def create_phase2e_database(path: Path, config: NotesConfig) -> None:
     connection.close()
 
 
+def create_phase2g_database(path: Path, config: NotesConfig) -> None:
+    create_phase2e_database(path, config)
+    connection = sqlite3.connect(path)
+    connection.execute("ALTER TABLE operations ADD COLUMN directory_name TEXT")
+    connection.execute("PRAGMA user_version = 3")
+    connection.commit()
+    connection.close()
+
+
 def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     path = tmp_path / "state" / "mykr-ops.db"
@@ -144,7 +153,10 @@ def test_phase1_database_migrates_without_losing_history_and_remains_usable(tmp_
     database.initialize()
 
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rename_items'"
+    ).fetchone() == ("rename_items",)
     row = connection.execute(
         "SELECT id, source_path, destination_path, sha256, undone_at, error_type, directory_name FROM operations WHERE id = 11"
     ).fetchone()
@@ -182,8 +194,11 @@ def test_phase2a_database_gains_error_type_without_losing_history(tmp_path: Path
     row = connection.execute(
         "SELECT id, source_path, destination_path, sha256, error_type FROM operations WHERE id = 11"
     ).fetchone()
+    assert version == 4
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rename_items'"
+    ).fetchone() == ("rename_items",)
     connection.close()
-    assert version == 3
     assert row[0] == 11
     assert row[1].endswith("01-Topic_CS_Course.md")
     assert row[2].endswith("01-Topic.md")
@@ -202,12 +217,34 @@ def test_phase2e_database_gains_directory_name_without_losing_history(tmp_path: 
     connection = sqlite3.connect(path)
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     row = connection.execute("SELECT id, error_type, directory_name FROM operations WHERE id = 11").fetchone()
+    assert version == 4
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rename_items'"
+    ).fetchone() == ("rename_items",)
     connection.close()
-    assert version == 3
     assert tuple(row) == (11, None, None)
 
 
-@pytest.mark.parametrize("create_database", [create_phase1_database, create_phase2a_database, create_phase2e_database])
+def test_phase2g_database_gains_rename_items_without_losing_history(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    path = tmp_path / "state" / "mykr-ops.db"
+    path.parent.mkdir()
+    create_phase2g_database(path, config)
+
+    Database(path).initialize()
+
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rename_items'"
+    ).fetchone() == ("rename_items",)
+    assert connection.execute("SELECT id, directory_name FROM operations WHERE id = 11").fetchone() == (11, None)
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "create_database", [create_phase1_database, create_phase2a_database, create_phase2e_database, create_phase2g_database]
+)
 def test_history_migrates_existing_legacy_database_before_reading(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,7 +262,7 @@ def test_history_migrates_existing_legacy_database_before_reading(
     assert cli.main(["history"]) == 0
 
     connection = sqlite3.connect(path)
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     connection.close()
     assert "Run 7: notes apply success" in capsys.readouterr().out
 
