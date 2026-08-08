@@ -68,9 +68,9 @@ MyKr-ops Rename works only on the files and folders you explicitly select. Selec
 mykr-ops rename gui "D:\Examples\draft report.txt" "D:\Examples\draft folder"
 ```
 
-It supports literal find/replace, prefix, suffix, numbering, sort, drag ordering, and per-item manual names. File extensions are locked; folders use their full name. It accepts files, folders, mixed selections, Unicode, spaces, and other normal Windows filename characters, but rejects reparse points, different parent directories, invalid names, reserved device names, extension changes, and occupied targets. More than 500 entries use a reduced UI mode intended for planning and preview.
+The GUI is in Simplified Chinese. Its **常规重命名** mode supports literal find/replace, prefix, and suffix. Its **连续编号** mode independently generates names such as `01.jpg`, `02.jpg`, or `EP-001-1080P.mkv`; the current displayed order determines the number sequence. Sort and drag ordering are available, and a per-item manual name always takes precedence until you choose **恢复自动**. File extensions are locked; folders use their full name. It accepts files, folders, mixed selections, Unicode, spaces, and other normal Windows filename characters, but rejects reparse points, different parent directories, invalid names, reserved device names, extension changes, and occupied targets. More than 500 entries use a reduced UI mode intended for planning and preview.
 
-The preview is side-effect free. Apply is enabled only when there is at least one change and every selected target is safe. The operation revalidates each selected object and parent directory immediately before it starts, never overwrites an existing entry, and uses temporary same-directory names so swaps, cycles, and case-only renames are safe. If any step fails, MyKr-ops attempts to restore the entire batch; an ambiguous interruption is recorded as `recovery_required` and blocks later file mutations rather than guessing.
+The preview is side-effect free. Apply is enabled only when there is at least one change and every selected target is safe. After a successful apply, the window refreshes to the actual new names with fresh rules so you can continue with another round; **撤销本次** always targets only that latest round. The operation revalidates each selected object and parent directory immediately before it starts, never overwrites an existing entry, and uses temporary same-directory names so swaps, cycles, and case-only renames are safe. If any step fails, MyKr-ops attempts to restore the entire batch; an ambiguous interruption is recorded as `recovery_required` and blocks later file mutations rather than guessing.
 
 Undo only the latest eligible rename batch:
 
@@ -86,7 +86,7 @@ To add the per-user Explorer **Send To** entry, run:
 mykr-ops rename install-sendto
 ```
 
-This creates (or safely updates) the owned `MyKr-ops Rename` shortcut in the Windows SendTo known folder. It targets the current environment's `pythonw.exe`, so launching the GUI does not open an extra console. It uses the selected Explorer paths directly; no registry entry, shell extension, administrator permission, or pywin32 dependency is required. MyKr-ops refuses to replace or remove a Send To entry unless it can prove the entry belongs to it. To remove the owned entry:
+This creates (or safely updates) the owned `MyKr-ops Rename` shortcut in the Windows SendTo known folder. It starts the Rename GUI without an extra console and passes the selected Explorer paths directly; no registry entry, shell extension, administrator permission, or pywin32 dependency is required. MyKr-ops refuses to replace or remove a Send To entry unless it can prove the entry belongs to it. To remove the owned entry:
 
 ```powershell
 mykr-ops rename uninstall-sendto

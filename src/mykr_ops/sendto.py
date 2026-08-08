@@ -13,8 +13,11 @@ from .filesystem import FilesystemSafetyError, assert_ordinary_directory, is_ord
 
 
 SHORTCUT_NAME = "MyKr-ops Rename.lnk"
-SHORTCUT_DESCRIPTION = "Managed by MyKr-ops Rename Send To integration v1"
-SHORTCUT_ARGUMENTS = "-m mykr_ops rename gui"
+LEGACY_SHORTCUT_DESCRIPTION = "Managed by MyKr-ops Rename Send To integration v1"
+LEGACY_SHORTCUT_ARGUMENTS = "-m mykr_ops rename gui"
+SHORTCUT_DESCRIPTION = "Managed by MyKr-ops Rename Send To integration v2"
+SHORTCUT_ARGUMENTS = ""
+LAUNCHER_NAME = "mykr-ops-rename.exe"
 
 
 class SendToError(RuntimeError):
@@ -73,6 +76,16 @@ def _pythonw_path() -> Path:
     return path
 
 
+def _launcher_path(*, require_exists: bool = True) -> Path:
+    path = Path(sys.executable).with_name(LAUNCHER_NAME)
+    if require_exists and not is_ordinary_file(path):
+        raise SendToError(
+            "MyKr-ops Rename launcher is unavailable. "
+            f"Run `{sys.executable} -m pip install -e \".[dev]\"` and try again."
+        )
+    return path
+
+
 def _run_powershell(script: str, *arguments: str) -> str:
     payload = base64.b64encode(
         json.dumps({"values": list(arguments)}, ensure_ascii=False).encode("utf-8")
@@ -116,25 +129,32 @@ def _shortcut_properties(path: Path) -> dict[str, str]:
     return {key: str(data.get(key, "")) for key in ("target", "arguments", "description")}
 
 
-def _is_owned_shortcut(path: Path, pythonw: Path | None = None) -> bool:
-    properties = _shortcut_properties(path)
-    expected_pythonw = pythonw or _pythonw_path()
+def _same_target(actual: str, expected: Path) -> bool:
     try:
-        same_target = Path(properties["target"]).resolve(strict=True) == expected_pythonw.resolve(strict=True)
+        return Path(actual).resolve(strict=True) == expected.resolve(strict=True)
     except OSError:
-        same_target = False
-    return (
-        same_target
-        and properties["arguments"] == SHORTCUT_ARGUMENTS
-        and properties["description"] == SHORTCUT_DESCRIPTION
-    )
+        return False
+
+
+def _is_owned_shortcut(
+    path: Path, launcher: Path | None = None, pythonw: Path | None = None
+) -> bool:
+    properties = _shortcut_properties(path)
+    if (
+        properties["arguments"] == LEGACY_SHORTCUT_ARGUMENTS
+        and properties["description"] == LEGACY_SHORTCUT_DESCRIPTION
+    ):
+        return _same_target(properties["target"], pythonw or _pythonw_path())
+    if properties["arguments"] == SHORTCUT_ARGUMENTS and properties["description"] == SHORTCUT_DESCRIPTION:
+        return _same_target(properties["target"], launcher or _launcher_path(require_exists=False))
+    return False
 
 
 def install_sendto() -> Path:
     path = shortcut_path()
-    pythonw = _pythonw_path()
+    launcher = _launcher_path()
     if path_exists(path):
-        if not _is_owned_shortcut(path, pythonw):
+        if not _is_owned_shortcut(path, launcher):
             raise SendToError(f"refusing to overwrite a Send To entry not owned by MyKr-ops: {path}")
     script = (
         "$shell = New-Object -ComObject WScript.Shell; "
@@ -144,8 +164,8 @@ def install_sendto() -> Path:
         "$shortcut.Description = $mykrArguments[3]; "
         "$shortcut.Save()"
     )
-    _run_powershell(script, str(path), str(pythonw), SHORTCUT_ARGUMENTS, SHORTCUT_DESCRIPTION)
-    if not _is_owned_shortcut(path, pythonw):
+    _run_powershell(script, str(path), str(launcher), SHORTCUT_ARGUMENTS, SHORTCUT_DESCRIPTION)
+    if not _is_owned_shortcut(path, launcher):
         raise SendToError("created Send To shortcut could not be verified as MyKr-ops owned")
     return path
 

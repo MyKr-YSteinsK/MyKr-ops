@@ -44,18 +44,23 @@ class RenameItemStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class RenameMode(StrEnum):
+    TRANSFORM = "transform"
+    NUMBERING = "numbering"
+
+
 @dataclass
 class RenameRules:
+    mode: RenameMode = RenameMode.TRANSFORM
     find: str = ""
     replace: str = ""
     prefix: str = ""
     suffix: str = ""
-    numbering_enabled: bool = False
-    numbering_position: str = "prefix"
     numbering_start: int = 1
     numbering_step: int = 1
     numbering_width: int = 2
-    numbering_separator: str = "-"
+    numbering_prefix: str = ""
+    numbering_suffix: str = ""
 
 
 @dataclass(frozen=True)
@@ -241,29 +246,23 @@ def _extension_for(source: RenameSource) -> str:
 
 
 def _validate_rules(rules: RenameRules) -> None:
-    if rules.numbering_position not in {"prefix", "suffix"}:
-        raise RenameValidationError("numbering position must be prefix or suffix")
+    try:
+        RenameMode(rules.mode)
+    except (TypeError, ValueError) as exc:
+        raise RenameValidationError("rename mode is invalid") from exc
     if rules.numbering_step == 0:
         raise RenameValidationError("numbering step cannot be zero")
     if rules.numbering_width < 1:
         raise RenameValidationError("numbering width must be at least one")
-    if any(character in '<>:"/\\|?*' or ord(character) < 32 for character in rules.numbering_separator):
-        raise RenameValidationError("numbering separator contains an invalid Windows filename character")
 
 
 def _automatic_stem(item: RenameItem, rules: RenameRules, index: int) -> str:
+    if RenameMode(rules.mode) == RenameMode.NUMBERING:
+        value = rules.numbering_start + index * rules.numbering_step
+        return f"{rules.numbering_prefix}{str(value).zfill(rules.numbering_width)}{rules.numbering_suffix}"
     original_stem = item.source.original_name[:-len(item.extension)] if item.extension else item.source.original_name
     stem = original_stem.replace(rules.find, rules.replace) if rules.find else original_stem
-    stem = f"{rules.prefix}{stem}{rules.suffix}"
-    if rules.numbering_enabled:
-        value = rules.numbering_start + index * rules.numbering_step
-        number = str(value).zfill(rules.numbering_width)
-        stem = (
-            f"{number}{rules.numbering_separator}{stem}"
-            if rules.numbering_position == "prefix"
-            else f"{stem}{rules.numbering_separator}{number}"
-        )
-    return stem
+    return f"{rules.prefix}{stem}{rules.suffix}"
 
 
 def _classify_plan_conflicts(plan: RenamePlan) -> None:

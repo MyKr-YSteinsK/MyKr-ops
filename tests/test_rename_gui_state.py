@@ -6,7 +6,7 @@ import pytest
 
 from mykr_ops import rename_gui
 from mykr_ops.database import Database
-from mykr_ops.rename import RenameResult, RenameRules, build_rename_plan
+from mykr_ops.rename import RenameMode, RenameResult, RenameRules, build_rename_plan
 from mykr_ops.rename_gui import RenameGuiState, _RenameWindow
 
 
@@ -55,15 +55,16 @@ def test_gui_state_drag_order_recomputes_numbering(tmp_path: Path) -> None:
     first.write_text("first", encoding="utf-8")
     second.write_text("second", encoding="utf-8")
     state = RenameGuiState(
-        build_rename_plan([first, second], RenameRules(numbering_enabled=True, numbering_width=1))
+        build_rename_plan([first, second], RenameRules(mode=RenameMode.NUMBERING, numbering_width=1))
     )
 
     state.move_item(1, 0)
 
-    assert [item.final_name for item in state.plan.items] == ["1-second.txt", "2-first.txt"]
+    assert [item.source.original_name for item in state.plan.items] == ["second.txt", "first.txt"]
+    assert [item.final_name for item in state.plan.items] == ["1.txt", "2.txt"]
 
 
-def test_gui_state_freezes_after_success_and_uses_large_item_modes(tmp_path: Path) -> None:
+def test_gui_state_tracks_latest_apply_without_freezing_and_uses_large_item_modes(tmp_path: Path) -> None:
     paths: list[Path] = []
     for number in range(201):
         path = tmp_path / f"entry-{number}.txt"
@@ -72,8 +73,10 @@ def test_gui_state_freezes_after_success_and_uses_large_item_modes(tmp_path: Pat
     state = RenameGuiState(build_rename_plan(paths, RenameRules(prefix="done-")))
 
     assert state.item_mode == "reduced"
-    state.complete(RenameResult(1, 201, 0, False, "Renamed 201 item(s)."))
-    assert state.completed
+    state.record_apply(RenameResult(1, 201, 0, False, "Renamed 201 item(s)."), tuple(paths))
+    assert state.last_apply_run_id == 1
+    assert state.apply_enabled
+    state.busy = True
     assert not state.apply_enabled
 
     for number in range(201, 501):
@@ -132,6 +135,7 @@ def test_gui_apply_flushes_pending_manual_and_rule_edits(tmp_path: Path, monkeyp
 
     def apply(plan: object, *_: object) -> RenameResult:
         captured.append(plan.items[0].final_name)  # type: ignore[attr-defined]
+        plan.items[0].source.path.rename(plan.items[0].final_path)  # type: ignore[attr-defined]
         return RenameResult(1, 1, 0, False, "Renamed 1 item.")
 
     monkeypatch.setattr(rename_gui, "apply_rename", apply)
@@ -140,15 +144,18 @@ def test_gui_apply_flushes_pending_manual_and_rule_edits(tmp_path: Path, monkeyp
         window._rows[source].stem.set("manual-new")
         window._apply_action()
         assert captured == ["manual-new.txt"]
+        assert window.state.plan.items[0].source.original_name == "manual-new.txt"
     finally:
         window.root.destroy()
 
     captured.clear()
-    window = make_window(tmp_path, [source], RenameRules(prefix="old-"))
+    second = tmp_path / "draft-two.txt"
+    second.write_text("data", encoding="utf-8")
+    window = make_window(tmp_path, [second], RenameRules(prefix="old-"))
     try:
         window._rule_variables["prefix"].set("new-")
         window._apply_action()
-        assert captured == ["new-draft.txt"]
+        assert captured == ["new-draft-two.txt"]
     finally:
         window.root.destroy()
 
@@ -168,7 +175,7 @@ def test_gui_apply_flush_blocks_pending_invalid_rules_and_manual_conflicts(
         window._apply_action()
         assert not calls
         assert str(window._apply["state"]) == "disabled"
-        assert "numbering step cannot be zero" in window._summary["text"]
+        assert "编号步长不能为 0" in window._summary["text"]
     finally:
         window.root.destroy()
 
@@ -179,7 +186,7 @@ def test_gui_apply_flush_blocks_pending_invalid_rules_and_manual_conflicts(
         window._apply_action()
         assert not calls
         assert not window.state.apply_enabled
-        assert "conflicts" in window._summary["text"]
+        assert "冲突" in window._summary["text"]
     finally:
         window.root.destroy()
 
@@ -233,7 +240,7 @@ def test_gui_reset_manual_edits_keeps_manual_overrides_when_current_rules_are_in
         window._reset_manual_edits()
 
         assert window.state.plan.items[0].is_manual
-        assert "numbering step cannot be zero" in str(window._summary["text"])
+        assert "编号步长不能为 0" in str(window._summary["text"])
         assert str(window._apply["state"]) == "disabled"
 
         window._rule_variables["numbering_step"].set("1")
@@ -241,5 +248,62 @@ def test_gui_reset_manual_edits_keeps_manual_overrides_when_current_rules_are_in
 
         assert not window.state.plan.items[0].is_manual
         assert window.state.plan.items[0].final_name == "batch-draft.txt"
+    finally:
+        window.root.destroy()
+
+
+def test_gui_uses_chinese_rename_workflow_labels(tmp_path: Path) -> None:
+    source = tmp_path / "draft.txt"
+    source.write_text("data", encoding="utf-8")
+    window = make_window(tmp_path, [source])
+    try:
+        texts: list[str] = []
+
+        def collect(widget: object) -> None:
+            try:
+                texts.append(str(widget.cget("text")))  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            for child in widget.winfo_children():  # type: ignore[attr-defined]
+                collect(child)
+
+        collect(window.root)
+        assert {
+            "常规重命名", "连续编号", "排序", "清除手动修改", "恢复自动", "起始值", "步长", "位数",
+            "固定前缀", "固定后缀", "原名称", "新名称", "状态", "无变化", "确认重命名 0 项",
+        } <= set(texts)
+        assert window.root.title() == "MyKr-ops 重命名"
+    finally:
+        window.root.destroy()
+
+
+def test_gui_rebases_after_multiple_rounds_and_undoes_only_the_latest_run(tmp_path: Path) -> None:
+    first = tmp_path / "a.txt"
+    second = tmp_path / "b.txt"
+    first.write_text("a", encoding="utf-8")
+    second.write_text("b", encoding="utf-8")
+    window = make_window(tmp_path, [first, second])
+    try:
+        window._select_mode(RenameMode.NUMBERING, "number")
+        window._apply_action()
+
+        first_round = window.state.last_apply_run_id
+        assert first_round is not None
+        assert [item.source.original_name for item in window.state.plan.items] == ["01.txt", "02.txt"]
+        assert not window.state.apply_enabled
+        assert str(window._rows[tmp_path / "01.txt"].entry["state"]) == "normal"
+
+        window._rows[tmp_path / "01.txt"].stem.set("cover")
+        window._apply_action()
+        second_round = window.state.last_apply_run_id
+        assert second_round is not None and second_round != first_round
+        assert [item.source.original_name for item in window.state.plan.items] == ["cover.txt", "02.txt"]
+
+        window._undo_action()
+        assert [item.source.original_name for item in window.state.plan.items] == ["01.txt", "02.txt"]
+        assert window.state.last_apply_run_id is None
+        assert str(window._rows[tmp_path / "01.txt"].entry["state"]) == "normal"
+        assert (tmp_path / "01.txt").exists()
+        assert not (tmp_path / "cover.txt").exists()
     finally:
         window.root.destroy()

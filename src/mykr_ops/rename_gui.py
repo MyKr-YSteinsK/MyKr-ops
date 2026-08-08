@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from .database import Database
+from .filesystem import FilesystemSafetyError
 from .rename import (
     RenameError,
     RenameItem,
     RenameItemStatus,
+    RenameMode,
     RenamePlan,
     RenameResult,
-    RenameRules,
     apply_rename,
     build_rename_plan,
     undo_rename_run,
@@ -24,12 +25,15 @@ class RenameGuiState:
     """UI-facing state; rename planning stays in the core module."""
 
     plan: RenamePlan
-    completed: bool = False
-    result: RenameResult | None = None
+    busy: bool = False
+    locked: bool = False
+    last_result: RenameResult | None = None
+    last_apply_run_id: int | None = None
+    last_apply_original_paths: tuple[Path, ...] = ()
 
     @property
     def apply_enabled(self) -> bool:
-        return not self.completed and self.plan.can_apply
+        return not self.busy and not self.locked and self.plan.can_apply
 
     @property
     def item_mode(self) -> str:
@@ -47,7 +51,7 @@ class RenameGuiState:
         invalid = sum(item.status == RenameItemStatus.INVALID for item in self.plan.items)
         conflict = sum(item.status == RenameItemStatus.CONFLICT for item in self.plan.items)
         failed = sum(item.status == RenameItemStatus.FAILED for item in self.plan.items)
-        return f"{changed} to rename · {unchanged} unchanged · {conflict} conflicts · {invalid + failed} invalid"
+        return f"{changed} 项将重命名 · {unchanged} 项无变化 · {conflict} 项冲突 · {invalid + failed} 项名称无效"
 
     def update_rules(self, **values: object) -> None:
         for name, value in values.items():
@@ -72,9 +76,10 @@ class RenameGuiState:
     def move_item(self, source_index: int, destination_index: int) -> None:
         self.plan.move_item(source_index, destination_index)
 
-    def complete(self, result: RenameResult) -> None:
-        self.result = result
-        self.completed = not result.failed
+    def record_apply(self, result: RenameResult, original_paths: tuple[Path, ...]) -> None:
+        self.last_result = result
+        self.last_apply_run_id = result.run_id
+        self.last_apply_original_paths = original_paths
 
 
 @dataclass
@@ -103,7 +108,10 @@ class _RenameWindow:
     _WARNING = "#9a6500"
     _DANGER = "#b33b43"
 
-    def __init__(self, tk: Any, ttk: Any, messagebox: Any, state: RenameGuiState, database: Database, logger: logging.Logger | None) -> None:
+    def __init__(
+        self, tk: Any, ttk: Any, messagebox: Any, state: RenameGuiState, database: Database,
+        logger: logging.Logger | None,
+    ) -> None:
         self.tk = tk
         self.ttk = ttk
         self.messagebox = messagebox
@@ -111,7 +119,7 @@ class _RenameWindow:
         self.database = database
         self.logger = logger
         self.root = tk.Tk()
-        self.root.title("MyKr-ops Rename")
+        self.root.title("MyKr-ops 重命名")
         self.root.geometry("1100x720")
         self.root.minsize(900, 600)
         self.root.configure(background=self._BACKGROUND)
@@ -121,7 +129,8 @@ class _RenameWindow:
         self._last_input_error: str | None = None
         self._drag_source: Path | None = None
         self._drag_target: int | None = None
-        self._active_panel = "find"
+        self._active_panel = "transform"
+        self._rule_controls: list[Any] = []
         self._configure_style()
         self._build()
 
@@ -145,29 +154,34 @@ class _RenameWindow:
         style.map("MyKr.Accent.TButton", background=[("active", "#174f89"), ("disabled", "#aeb8c5")], foreground=[("disabled", "#f3f5f7")])
         style.configure("MyKr.TEntry", fieldbackground=self._SURFACE, foreground=self._TEXT, padding=(6, 4))
         style.map("MyKr.TEntry", fieldbackground=[("focus", "#ffffff")])
-        style.configure("MyKr.TCheckbutton", background=self._SURFACE, foreground=self._TEXT, font=("Segoe UI", 9))
-        style.configure("MyKr.TCombobox", fieldbackground=self._SURFACE, foreground=self._TEXT, padding=(5, 3))
 
     def _build(self) -> None:
         header = self.ttk.Frame(self.root, style="MyKr.TFrame", padding=(24, 16, 24, 6))
         header.pack(fill="x")
-        self.ttk.Label(header, text="MyKr-ops Rename", style="MyKr.Header.TLabel").pack(side="left")
-        self.ttk.Label(header, text=f"{len(self.state.plan.items)} items", style="MyKr.Muted.TLabel").pack(side="right", pady=(5, 0))
+        self.ttk.Label(header, text="MyKr-ops 重命名", style="MyKr.Header.TLabel").pack(side="left")
+        self.ttk.Label(header, text=f"已选择 {len(self.state.plan.items)} 项", style="MyKr.Muted.TLabel").pack(side="right", pady=(5, 0))
         self.ttk.Label(self.root, text=str(self.state.plan.parent), style="MyKr.Muted.TLabel", padding=(24, 0, 24, 12)).pack(fill="x")
 
         tools = self.ttk.Frame(self.root, style="MyKr.Surface.TFrame", padding=(24, 8, 24, 0))
         tools.pack(fill="x", padx=24)
         self._tab_host = self.ttk.Frame(tools, style="MyKr.Surface.TFrame")
         self._tab_host.pack(fill="x")
-        for text, panel in (("Find / replace", "find"), ("Prefix / suffix", "affix"), ("Numbering", "number"), ("Order", "order")):
-            self.ttk.Button(self._tab_host, text=text, style="MyKr.Tab.TButton", command=lambda value=panel: self._show_panel(value)).pack(side="left", padx=(0, 6))
-        self._reset_manual = self.ttk.Button(
-            self._tab_host,
-            text="Reset manual edits",
-            style="MyKr.TButton",
-            command=self._reset_manual_edits,
-        )
+        for text, mode, panel in (
+            ("常规重命名", RenameMode.TRANSFORM, "transform"),
+            ("连续编号", RenameMode.NUMBERING, "number"),
+        ):
+            button = self.ttk.Button(
+                self._tab_host, text=text, style="MyKr.Tab.TButton",
+                command=lambda value=mode, panel_name=panel: self._select_mode(value, panel_name),
+            )
+            button.pack(side="left", padx=(0, 6))
+            self._rule_controls.append(button)
+        order_button = self.ttk.Button(self._tab_host, text="排序", style="MyKr.Tab.TButton", command=lambda: self._show_panel("order"))
+        order_button.pack(side="left", padx=(0, 6))
+        self._rule_controls.append(order_button)
+        self._reset_manual = self.ttk.Button(self._tab_host, text="清除手动修改", style="MyKr.TButton", command=self._reset_manual_edits)
         self._reset_manual.pack(side="right")
+
         self._panel_host = self.tk.Frame(tools, background=self._SURFACE, height=0)
         self._panel_host.pack(fill="x", pady=(5, 8))
         self._panel_host.pack_propagate(False)
@@ -180,9 +194,9 @@ class _RenameWindow:
         headings = self.ttk.Frame(body, style="MyKr.Surface.TFrame")
         headings.pack(fill="x", pady=(0, 5))
         self.ttk.Label(headings, text="", style="MyKr.SurfaceMuted.TLabel", width=4).pack(side="left")
-        self.ttk.Label(headings, text="Original name", style="MyKr.SurfaceMuted.TLabel", width=30).pack(side="left")
-        self.ttk.Label(headings, text="New name", style="MyKr.SurfaceMuted.TLabel", width=36).pack(side="left", padx=(12, 0))
-        self.ttk.Label(headings, text="Status", style="MyKr.SurfaceMuted.TLabel").pack(side="left", padx=(12, 0))
+        self.ttk.Label(headings, text="原名称", style="MyKr.SurfaceMuted.TLabel", width=30).pack(side="left")
+        self.ttk.Label(headings, text="新名称", style="MyKr.SurfaceMuted.TLabel", width=36).pack(side="left", padx=(12, 0))
+        self.ttk.Label(headings, text="状态", style="MyKr.SurfaceMuted.TLabel").pack(side="left", padx=(12, 0))
         self._canvas = self.tk.Canvas(body, background=self._SURFACE, highlightthickness=0, borderwidth=0)
         scrollbar = self.ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
         self._list_host = self.ttk.Frame(self._canvas, style="MyKr.Surface.TFrame")
@@ -196,16 +210,18 @@ class _RenameWindow:
         footer.pack(fill="x")
         self._summary = self.ttk.Label(footer, text=self.state.summary, style="MyKr.Muted.TLabel")
         self._summary.pack(side="left")
-        self._undo = self.ttk.Button(footer, text="Undo this batch", style="MyKr.TButton", command=self._undo_action)
+        self._undo = self.ttk.Button(footer, text="撤销本次", style="MyKr.TButton", command=self._undo_action)
         self._apply = self.ttk.Button(footer, text="", style="MyKr.Accent.TButton", command=self._apply_action)
         self._apply.pack(side="right")
-        self.ttk.Button(footer, text="Cancel", style="MyKr.TButton", command=self.root.destroy).pack(side="right", padx=(0, 8))
+        self._cancel = self.ttk.Button(footer, text="取消", style="MyKr.TButton", command=self.root.destroy)
+        self._cancel.pack(side="right", padx=(0, 8))
 
         self._canvas.bind("<Configure>", lambda event: self._canvas.itemconfigure(self._list_window, width=event.width))
         self._list_host.bind("<Configure>", lambda _event: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self.root.bind_all("<MouseWheel>", self._scroll)
         self._rebuild_rows()
-        self._show_panel("find", animate=False)
+        initial_panel = "number" if self.state.plan.rules.mode == RenameMode.NUMBERING else "transform"
+        self._show_panel(initial_panel, animate=False)
         self._fade_in()
 
     def _new_rule_variables(self) -> dict[str, Any]:
@@ -215,44 +231,66 @@ class _RenameWindow:
             "replace": self.tk.StringVar(value=rules.replace),
             "prefix": self.tk.StringVar(value=rules.prefix),
             "suffix": self.tk.StringVar(value=rules.suffix),
-            "numbering_enabled": self.tk.BooleanVar(value=rules.numbering_enabled),
-            "numbering_position": self.tk.StringVar(value=rules.numbering_position),
             "numbering_start": self.tk.StringVar(value=str(rules.numbering_start)),
             "numbering_step": self.tk.StringVar(value=str(rules.numbering_step)),
             "numbering_width": self.tk.StringVar(value=str(rules.numbering_width)),
-            "numbering_separator": self.tk.StringVar(value=rules.numbering_separator),
+            "numbering_prefix": self.tk.StringVar(value=rules.numbering_prefix),
+            "numbering_suffix": self.tk.StringVar(value=rules.numbering_suffix),
         }
         for variable in values.values():
             variable.trace_add("write", self._schedule_rule_update)
         return values
 
     def _build_panels(self) -> None:
-        find = self.ttk.Frame(self._panel_host, style="MyKr.Surface.TFrame")
-        self._panels["find"] = find
-        self._entry_pair(find, "Find", "find", 0)
-        self._entry_pair(find, "Replace", "replace", 1)
-        affix = self.ttk.Frame(self._panel_host, style="MyKr.Surface.TFrame")
-        self._panels["affix"] = affix
-        self._entry_pair(affix, "Prefix", "prefix", 0)
-        self._entry_pair(affix, "Suffix", "suffix", 1)
+        transform = self.ttk.Frame(self._panel_host, style="MyKr.Surface.TFrame")
+        self._panels["transform"] = transform
+        self._entry_pair(transform, "查找", "find", 0)
+        self._entry_pair(transform, "替换为", "replace", 1)
+        self._entry_pair(transform, "前缀", "prefix", 2)
+        self._entry_pair(transform, "后缀", "suffix", 3)
+
         number = self.ttk.Frame(self._panel_host, style="MyKr.Surface.TFrame")
         self._panels["number"] = number
-        self.ttk.Checkbutton(number, text="Add numbering", style="MyKr.TCheckbutton", variable=self._rule_variables["numbering_enabled"]).grid(row=0, column=0, sticky="w", padx=(0, 16))
-        self.ttk.Combobox(number, textvariable=self._rule_variables["numbering_position"], values=("prefix", "suffix"), state="readonly", style="MyKr.TCombobox", width=10).grid(row=0, column=1, padx=(0, 12))
-        for column, (label, name) in enumerate((("Start", "numbering_start"), ("Step", "numbering_step"), ("Zero fill", "numbering_width"), ("Separator", "numbering_separator")), start=2):
-            self.ttk.Label(number, text=label, style="MyKr.SurfaceMuted.TLabel").grid(row=0, column=column, sticky="w")
-            self.ttk.Entry(number, textvariable=self._rule_variables[name], style="MyKr.TEntry", width=8).grid(row=1, column=column, padx=(0, 12), sticky="w")
+        for column, (label, name, width) in enumerate((
+            ("起始值", "numbering_start", 8), ("步长", "numbering_step", 8), ("位数", "numbering_width", 8),
+            ("固定前缀", "numbering_prefix", 20), ("固定后缀", "numbering_suffix", 20),
+        )):
+            self.ttk.Label(number, text=label, style="MyKr.SurfaceMuted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 12))
+            entry = self.ttk.Entry(number, textvariable=self._rule_variables[name], style="MyKr.TEntry", width=width)
+            entry.grid(row=1, column=column, padx=(0, 12), sticky="w")
+            self._rule_controls.append(entry)
+
         order = self.ttk.Frame(self._panel_host, style="MyKr.Surface.TFrame")
         self._panels["order"] = order
-        self.ttk.Button(order, text="Name ascending", style="MyKr.TButton", command=lambda: self._sort(False)).pack(side="left", padx=(0, 8))
-        self.ttk.Button(order, text="Name descending", style="MyKr.TButton", command=lambda: self._sort(True)).pack(side="left", padx=(0, 8))
-        self.ttk.Button(order, text="Restore initial order", style="MyKr.TButton", command=self._restore_order).pack(side="left")
+        for text, command in (
+            ("按名称升序", lambda: self._sort(False)),
+            ("按名称降序", lambda: self._sort(True)),
+            ("恢复初始顺序", self._restore_order),
+        ):
+            button = self.ttk.Button(order, text=text, style="MyKr.TButton", command=command)
+            button.pack(side="left", padx=(0, 8))
+            self._rule_controls.append(button)
 
     def _entry_pair(self, panel: Any, label: str, variable: str, column: int) -> None:
         self.ttk.Label(panel, text=label, style="MyKr.SurfaceMuted.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 12))
-        self.ttk.Entry(panel, textvariable=self._rule_variables[variable], style="MyKr.TEntry", width=28).grid(row=1, column=column, sticky="w", padx=(0, 12))
+        entry = self.ttk.Entry(panel, textvariable=self._rule_variables[variable], style="MyKr.TEntry", width=22)
+        entry.grid(row=1, column=column, sticky="w", padx=(0, 12))
+        self._rule_controls.append(entry)
+
+    def _select_mode(self, mode: RenameMode, panel: str) -> None:
+        if self.state.busy or self.state.locked or not self._commit_rules():
+            return
+        try:
+            self.state.update_rules(mode=mode)
+        except RenameError as exc:
+            self._show_input_error(exc)
+            return
+        self._show_panel(panel)
+        self._update_rows()
 
     def _show_panel(self, name: str, *, animate: bool = True) -> None:
+        if self.state.busy or self.state.locked:
+            return
         if name == self._active_panel and self._panels.get(name, {}).winfo_manager():
             return
         for panel in self._panels.values():
@@ -302,9 +340,9 @@ class _RenameWindow:
         extension.pack(side="left")
         status = self.ttk.Label(frame, text="", style="MyKr.SurfaceMuted.TLabel", width=28)
         status.pack(side="left", padx=(12, 0))
-        manual = self.ttk.Label(frame, text="", style="MyKr.SurfaceMuted.TLabel", width=7)
+        manual = self.ttk.Label(frame, text="", style="MyKr.SurfaceMuted.TLabel", width=8)
         manual.pack(side="left", padx=(6, 0))
-        restore = self.ttk.Button(frame, text="Auto", style="MyKr.TButton")
+        restore = self.ttk.Button(frame, text="恢复自动", style="MyKr.TButton")
         restore.pack(side="right")
         view = _RenameRowView(item.source.path, frame, stem, entry, extension, status, manual, restore)
         self._rows[item.source.path] = view
@@ -348,7 +386,7 @@ class _RenameWindow:
         view.was_manual = item.is_manual
 
     def _schedule_manual(self, source_path: Path) -> None:
-        if self._rendering or self.state.completed:
+        if self._rendering or self.state.busy or self.state.locked:
             return
         view = self._rows[source_path]
         if view.debounce_id is not None:
@@ -368,9 +406,7 @@ class _RenameWindow:
         try:
             self.state.set_manual_stem(index, view.stem.get())
         except RenameError as exc:
-            self._last_input_error = f"Input error: {exc}"
-            self._summary.configure(text=self._last_input_error)
-            self._apply.configure(state="disabled")
+            self._show_input_error(exc)
             return False
         self._update_rows(active_source=source_path)
         return True
@@ -391,25 +427,37 @@ class _RenameWindow:
         return "break"
 
     def _restore_pre_edit(self, source_path: Path) -> str:
+        if not self._commit_rules():
+            return "break"
         view = self._rows[source_path]
         if view.debounce_id is not None:
             self.root.after_cancel(view.debounce_id)
             view.debounce_id = None
         index = self._item_index(source_path)
-        if view.was_manual:
-            self.state.set_manual_stem(index, view.pre_edit_value)
-        else:
-            self.state.restore_automatic(index)
+        try:
+            if view.was_manual:
+                self.state.set_manual_stem(index, view.pre_edit_value)
+            else:
+                self.state.restore_automatic(index)
+        except RenameError as exc:
+            self._show_input_error(exc)
+            return "break"
         view.stem.set(self.state.plan.items[index].editable_stem)
         self._update_rows(active_source=source_path)
         return "break"
 
     def _restore_auto(self, source_path: Path) -> None:
-        self.state.restore_automatic(self._item_index(source_path))
+        if self.state.busy or self.state.locked or not self._commit_rules():
+            return
+        try:
+            self.state.restore_automatic(self._item_index(source_path))
+        except RenameError as exc:
+            self._show_input_error(exc)
+            return
         self._update_rows()
 
     def _reset_manual_edits(self) -> None:
-        if self.state.completed:
+        if self.state.busy or self.state.locked:
             return
         for view in self._rows.values():
             if view.debounce_id is not None:
@@ -418,14 +466,13 @@ class _RenameWindow:
         if self._rules_after_id is not None:
             self.root.after_cancel(self._rules_after_id)
             self._rules_after_id = None
-        rules_valid = self._commit_rules()
-        if not rules_valid:
+        if not self._commit_rules():
             return
         self.state.clear_manual_overrides()
         self._update_rows()
 
     def _schedule_rule_update(self, *_: object) -> None:
-        if self._rendering or self.state.completed:
+        if self._rendering or self.state.busy or self.state.locked:
             return
         if self._rules_after_id is not None:
             self.root.after_cancel(self._rules_after_id)
@@ -437,21 +484,39 @@ class _RenameWindow:
             self.state.update_rules(
                 find=self._rule_variables["find"].get(), replace=self._rule_variables["replace"].get(),
                 prefix=self._rule_variables["prefix"].get(), suffix=self._rule_variables["suffix"].get(),
-                numbering_enabled=self._rule_variables["numbering_enabled"].get(),
-                numbering_position=self._rule_variables["numbering_position"].get(),
                 numbering_start=int(self._rule_variables["numbering_start"].get()),
                 numbering_step=int(self._rule_variables["numbering_step"].get()),
                 numbering_width=int(self._rule_variables["numbering_width"].get()),
-                numbering_separator=self._rule_variables["numbering_separator"].get(),
+                numbering_prefix=self._rule_variables["numbering_prefix"].get(),
+                numbering_suffix=self._rule_variables["numbering_suffix"].get(),
             )
         except (ValueError, RenameError) as exc:
-            self._last_input_error = f"Input error: {exc}"
-            self._summary.configure(text=self._last_input_error)
-            self._apply.configure(state="disabled")
+            self._show_input_error(exc)
             return False
         self._last_input_error = None
         self._update_rows()
         return True
+
+    def _show_input_error(self, error: BaseException) -> None:
+        self._last_input_error = f"输入错误：{self._friendly_error(str(error))}"
+        self._summary.configure(text=self._last_input_error)
+        self._apply.configure(state="disabled")
+
+    @staticmethod
+    def _friendly_error(message: str) -> str:
+        translations = {
+            "numbering step cannot be zero": "编号步长不能为 0",
+            "numbering width must be at least one": "编号位数至少为 1",
+            "name is empty": "名称不能为空",
+            "name is a reserved Windows device name": "名称是 Windows 保留设备名",
+            "name must not end in a space or period": "名称不能以空格或句点结尾",
+            "name contains an invalid Windows filename character": "名称包含 Windows 不允许的字符",
+            "multiple selected items resolve to the same target name": "多个选中项会得到相同名称",
+            "target name is occupied by an unselected filesystem object": "目标名称已被未选中的项目占用",
+            "select at least one file or folder to rename": "请至少选择一个文件或文件夹",
+            "all selected items must belong to one ordinary parent directory": "所有选中项必须位于同一普通父目录",
+        }
+        return translations.get(message, message if message else "输入格式无效")
 
     def _flush_pending_state(self) -> bool:
         if self._rules_after_id is not None:
@@ -465,7 +530,7 @@ class _RenameWindow:
             view.debounce_id = None
             valid = self._commit_manual(source_path) and valid
         if not valid:
-            self._summary.configure(text=self._last_input_error or "Input error: rename settings are invalid")
+            self._summary.configure(text=self._last_input_error or "输入错误：重命名设置无效")
             self._apply.configure(state="disabled")
             return False
         self.state.plan.recompute()
@@ -475,48 +540,55 @@ class _RenameWindow:
     def _update_rows(self, active_source: Path | None = None) -> None:
         self._rendering = True
         try:
+            locked = self.state.busy or self.state.locked
             for item in self.state.plan.items:
                 view = self._rows[item.source.path]
                 if (
-                    item.source.path != active_source
-                    and view.debounce_id is None
-                    and not item.is_manual
+                    item.source.path != active_source and view.debounce_id is None and not item.is_manual
                     and view.stem.get() != item.editable_stem
                 ):
                     view.stem.set(item.editable_stem)
                 view.extension.configure(text=item.extension)
                 status, style = self._status(item)
                 view.status.configure(text=status, style=style)
-                view.manual.configure(text="Manual" if item.is_manual else "", style="MyKr.Success.TLabel" if item.is_manual else "MyKr.SurfaceMuted.TLabel")
-                view.restore.configure(state="normal" if item.is_manual and not self.state.completed else "disabled")
-                view.entry.configure(state="disabled" if self.state.completed else "normal")
-            self._summary.configure(text=self.state.summary)
+                view.manual.configure(text="手动修改" if item.is_manual else "", style="MyKr.Success.TLabel" if item.is_manual else "MyKr.SurfaceMuted.TLabel")
+                view.restore.configure(state="normal" if item.is_manual and not locked else "disabled")
+                view.entry.configure(state="disabled" if locked else "normal")
+            self._summary.configure(text=self._last_input_error or self.state.summary)
             changed = len(self.state.plan.changed_items)
-            self._apply.configure(text=f"Confirm rename {changed} item(s)", state="normal" if self.state.apply_enabled else "disabled")
+            apply_text = "正在重命名…" if self.state.busy else f"确认重命名 {changed} 项"
+            self._apply.configure(text=apply_text, state="normal" if self.state.apply_enabled else "disabled")
             has_manual = any(item.is_manual for item in self.state.plan.items)
-            self._reset_manual.configure(state="normal" if has_manual and not self.state.completed else "disabled")
+            self._reset_manual.configure(state="normal" if has_manual and not locked else "disabled")
+            for control in self._rule_controls:
+                control.configure(state="disabled" if locked else "normal")
+            self._undo.configure(state="normal" if self.state.last_apply_run_id is not None and not locked else "disabled")
         finally:
             self._rendering = False
 
     def _status(self, item: RenameItem) -> tuple[str, str]:
         if item.status == RenameItemStatus.CHANGED:
-            return "Will rename", "MyKr.Success.TLabel"
+            return "将重命名", "MyKr.Success.TLabel"
         if item.status == RenameItemStatus.UNCHANGED:
-            return "Unchanged", "MyKr.SurfaceMuted.TLabel"
+            return "无变化", "MyKr.SurfaceMuted.TLabel"
         if item.status == RenameItemStatus.CONFLICT:
-            return item.reason or "Conflict", "MyKr.Warning.TLabel"
-        return item.reason or item.status.value.title(), "MyKr.Danger.TLabel"
+            return f"冲突：{self._friendly_error(item.reason or '')}", "MyKr.Warning.TLabel"
+        return f"名称无效：{self._friendly_error(item.reason or item.status.value)}", "MyKr.Danger.TLabel"
 
     def _sort(self, descending: bool) -> None:
+        if self.state.busy or self.state.locked or not self._flush_pending_state():
+            return
         self.state.sort_by_name(descending)
         self._rebuild_rows()
 
     def _restore_order(self) -> None:
+        if self.state.busy or self.state.locked or not self._flush_pending_state():
+            return
         self.state.restore_order()
         self._rebuild_rows()
 
     def _start_drag(self, source_path: Path) -> None:
-        if not self.state.completed:
+        if not self.state.busy and not self.state.locked:
             self._drag_source = source_path
 
     def _drag_motion(self, event: Any) -> None:
@@ -541,48 +613,114 @@ class _RenameWindow:
         self._drag_indicator.pack_forget()
         if source_path is None or target is None:
             return
+        if not self._flush_pending_state():
+            return
         source_index = self._item_index(source_path)
         if source_index != target:
             self.state.move_item(source_index, target)
             self._rebuild_rows()
 
+    def _set_rule_variables(self) -> None:
+        rules = self.state.plan.rules
+        values = {
+            "find": rules.find,
+            "replace": rules.replace,
+            "prefix": rules.prefix,
+            "suffix": rules.suffix,
+            "numbering_start": str(rules.numbering_start),
+            "numbering_step": str(rules.numbering_step),
+            "numbering_width": str(rules.numbering_width),
+            "numbering_prefix": rules.numbering_prefix,
+            "numbering_suffix": rules.numbering_suffix,
+        }
+        self._rendering = True
+        try:
+            for name, value in values.items():
+                self._rule_variables[name].set(value)
+        finally:
+            self._rendering = False
+
+    def _rebase(self, paths: tuple[Path, ...]) -> None:
+        fresh_plan = build_rename_plan(paths)
+        self.state.plan = fresh_plan
+        self._last_input_error = None
+        self._set_rule_variables()
+        self._rebuild_rows()
+
     def _apply_action(self) -> None:
         if not self._flush_pending_state():
             return
-        self._apply.configure(state="disabled", text="Applying…")
+        final_paths = tuple(item.final_path for item in self.state.plan.items)
+        original_paths = tuple(item.source.path for item in self.state.plan.items)
+        self.state.busy = True
+        self._update_rows()
         self.root.update_idletasks()
         try:
             result = apply_rename(self.state.plan, self.database, self.logger)
         except Exception as exc:
             if self.logger:
                 self.logger.exception("rename gui apply failed: %s", exc)
-            self.messagebox.showerror("MyKr-ops Rename", str(exc), parent=self.root)
+            self.state.busy = False
             self._update_rows()
+            self._show_error("重命名失败", exc)
             return
-        self.state.complete(result)
+        self.state.busy = False
         if result.failed:
-            self.messagebox.showerror("MyKr-ops Rename", result.message, parent=self.root)
             self._update_rows()
+            self._show_error("重命名失败", RenameError(result.message))
             return
+        self.state.record_apply(result, original_paths)
+        try:
+            self._rebase(final_paths)
+        except (RenameError, FilesystemSafetyError, OSError) as exc:
+            self.state.locked = True
+            self._update_rows()
+            self._show_error("重命名已完成，但无法安全刷新预览", exc)
+            return
+        self._undo.pack(side="right", padx=(0, 8))
+        self._summary.configure(text=f"已成功重命名 {result.renamed_count} 项")
         self._update_rows()
-        self._summary.configure(text=f"Renamed {result.renamed_count} items. This window can undo exactly this batch.")
-        self._apply.pack_forget()
-        self._undo.pack(side="right")
+        self._summary.configure(text=f"已成功重命名 {result.renamed_count} 项")
 
     def _undo_action(self) -> None:
-        if self.state.result is None or self.state.result.run_id is None:
-            self.messagebox.showerror("MyKr-ops Rename", "This window has no completed batch to undo.", parent=self.root)
+        run_id = self.state.last_apply_run_id
+        original_paths = self.state.last_apply_original_paths
+        if run_id is None or not original_paths:
+            self._show_error("无法撤销", RenameError("当前窗口没有可撤销的重命名操作。"))
             return
+        self.state.busy = True
+        self._update_rows()
+        self.root.update_idletasks()
         try:
-            result = undo_rename_run(self.database, self.state.result.run_id, self.logger)
+            result = undo_rename_run(self.database, run_id, self.logger)
         except Exception as exc:
             if self.logger:
                 self.logger.exception("rename gui exact undo failed: %s", exc)
-            self.messagebox.showerror("MyKr-ops Rename", str(exc), parent=self.root)
+            self.state.busy = False
+            self._update_rows()
+            self._show_error("撤销失败", exc)
             return
-        self.messagebox.showinfo("MyKr-ops Rename", result.message, parent=self.root)
-        if not result.failed:
-            self._undo.configure(state="disabled")
+        self.state.busy = False
+        if result.failed:
+            self._update_rows()
+            self._show_error("撤销失败", RenameError(result.message))
+            return
+        self.state.last_result = None
+        self.state.last_apply_run_id = None
+        self.state.last_apply_original_paths = ()
+        try:
+            self._rebase(original_paths)
+        except (RenameError, FilesystemSafetyError, OSError) as exc:
+            self.state.locked = True
+            self._update_rows()
+            self._show_error("撤销已完成，但无法安全刷新预览", exc)
+            return
+        self._summary.configure(text="已撤销本次重命名")
+        self._update_rows()
+        self._summary.configure(text="已撤销本次重命名")
+
+    def _show_error(self, title: str, error: BaseException) -> None:
+        self.messagebox.showerror("MyKr-ops 重命名", f"{title}：{self._friendly_error(str(error))}", parent=self.root)
 
     def _scroll(self, event: Any) -> None:
         self._canvas.yview_scroll(int(-event.delta / 120), "units")

@@ -16,6 +16,9 @@ dev = ["pytest>=8"]
 [project.scripts]
 mykr-ops = "mykr_ops.cli:main"
 
+[project.gui-scripts]
+mykr-ops-rename = "mykr_ops.rename_launcher:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
