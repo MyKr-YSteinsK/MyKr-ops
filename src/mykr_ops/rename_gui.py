@@ -419,11 +419,10 @@ class _RenameWindow:
             self.root.after_cancel(self._rules_after_id)
             self._rules_after_id = None
         rules_valid = self._commit_rules()
+        if not rules_valid:
+            return
         self.state.clear_manual_overrides()
         self._update_rows()
-        if not rules_valid:
-            self._summary.configure(text=self._last_input_error or "Input error: rename settings are invalid")
-            self._apply.configure(state="disabled")
 
     def _schedule_rule_update(self, *_: object) -> None:
         if self._rendering or self.state.completed:

@@ -218,3 +218,28 @@ def test_gui_reset_manual_edits_clears_pending_and_committed_overrides(tmp_path:
         assert window._rows[first].stem.get() == "current-first"
     finally:
         window.root.destroy()
+
+
+def test_gui_reset_manual_edits_keeps_manual_overrides_when_current_rules_are_invalid(tmp_path: Path) -> None:
+    source = tmp_path / "draft.txt"
+    source.write_text("data", encoding="utf-8")
+    window = make_window(tmp_path, [source], RenameRules(prefix="batch-"))
+    try:
+        window._rows[source].stem.set("manual-name")
+        assert window._flush_pending_state()
+        assert window.state.plan.items[0].is_manual
+
+        window._rule_variables["numbering_step"].set("0")
+        window._reset_manual_edits()
+
+        assert window.state.plan.items[0].is_manual
+        assert "numbering step cannot be zero" in str(window._summary["text"])
+        assert str(window._apply["state"]) == "disabled"
+
+        window._rule_variables["numbering_step"].set("1")
+        window._reset_manual_edits()
+
+        assert not window.state.plan.items[0].is_manual
+        assert window.state.plan.items[0].final_name == "batch-draft.txt"
+    finally:
+        window.root.destroy()
