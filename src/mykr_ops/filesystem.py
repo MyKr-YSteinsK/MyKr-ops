@@ -248,9 +248,9 @@ def entry_identity(path: Path) -> EntryIdentity:
             raise FilesystemSafetyError(f"could not inspect {path}: {exc}") from exc
         return EntryIdentity(kind, int(metadata.st_dev), int(metadata.st_ino))
 
-    handle = _open_rename_entry_handle(path, kind)
+    handle = _open_entry_identity_handle(path, kind)
     try:
-        identity = _handle_identity(handle, f"rename source {path}")
+        identity = _handle_identity(handle, f"identity {path}")
         return EntryIdentity(kind, identity[0], identity[1])
     finally:
         _close_handle(handle)
@@ -649,17 +649,25 @@ def _open_rename_entry_handle(path: Path, expected_kind: str) -> int:
 
 def _open_entry_identity_handle(path: Path, expected_kind: str) -> int:
     handle = _create_file(
-        str(path), _FILE_READ_ATTRIBUTES | _SYNCHRONIZE, _FILE_SHARE_READ,
+        str(path), _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
         None, _OPEN_EXISTING,
         _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
     )
     if handle == _INVALID_HANDLE_VALUE:
-        _raise_windows_error(f"could not safely inspect renamed entry {path}")
+        _raise_windows_error(f"could not safely inspect identity {path}")
     try:
-        identity = _handle_identity(handle, f"renamed entry {path}")
+        if _get_file_type(handle) != _FILE_TYPE_DISK:
+            raise FilesystemSafetyError(f"identity path is not a regular disk entry: {path}")
+        identity = _handle_identity(handle, f"identity {path}")
         is_directory = bool(identity[4] & _FILE_ATTRIBUTE_DIRECTORY)
-        if identity[4] & FILE_ATTRIBUTE_REPARSE_POINT or (expected_kind == "directory") != is_directory:
-            raise FilesystemSafetyError(f"renamed entry verification failed: {path}")
+        if identity[4] & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise FilesystemSafetyError(
+                f"identity path is a symbolic link, junction, or reparse point: {path}",
+                error_type="unsafe_reparse_point",
+            )
+        if (expected_kind == "directory") != is_directory:
+            raise FilesystemSafetyError(f"identity path kind changed: {path}", error_type="source_changed")
         return handle
     except BaseException:
         _close_handle(handle)

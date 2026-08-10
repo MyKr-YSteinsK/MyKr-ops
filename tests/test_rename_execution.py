@@ -212,3 +212,30 @@ def test_windows_verified_rename_parent_cannot_be_replaced_during_rename(
     assert attempts
     assert destination.read_text(encoding="utf-8") == "data"
     assert not replacement.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing-mode integration")
+def test_windows_rename_planning_allows_an_explorer_like_parent_handle(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("data", encoding="utf-8")
+    explorer_handle = filesystem._create_file(
+        str(tmp_path),
+        filesystem._FILE_LIST_DIRECTORY | filesystem._FILE_READ_ATTRIBUTES | filesystem._SYNCHRONIZE,
+        filesystem._FILE_SHARE_READ | filesystem._FILE_SHARE_WRITE,
+        None,
+        filesystem._OPEN_EXISTING,
+        filesystem._FILE_FLAG_BACKUP_SEMANTICS | filesystem._FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    assert explorer_handle != filesystem._INVALID_HANDLE_VALUE
+    try:
+        with pytest.raises(filesystem.FilesystemSafetyError):
+            filesystem._open_rename_entry_handle(tmp_path, "directory")
+
+        parent_identity = filesystem.entry_identity(tmp_path)
+        plan = build_rename_plan([source])
+
+        assert parent_identity == plan.parent_identity
+        assert plan.items[0].source.path == source
+    finally:
+        assert filesystem._close_handle(explorer_handle)
