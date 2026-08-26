@@ -1,6 +1,6 @@
 # MyKr-ops Current State
 
-Last reconciled: 2026-08-26.
+Last reconciled: 2026-08-27.
 
 ## Repository identity
 
@@ -51,13 +51,14 @@ The migration verification was run against the post-adoption source/documentatio
 - Documentation/metadata review — PASS: product source, tests, pyproject.toml, workflow, config contract, schema, and version were not intentionally changed.
 - Ownership/private-boundary review — PASS: canonical owners are distinct; legacy handoffs are not tracked or active; no database, log, Send To shortcut, virtual environment, or other private/generated artifact is part of the change set.
 
-## OPS-Plan02 acceptance evidence
+## OPS-Plan02 acceptance evidence (historical / residual risk)
 
 - Disposable fixture setup — PASS: `D:/CS/temp/MyKrops/OPS-Plan02-Rename-acceptance-20260826` contains a small six-item matrix, a 220-item reduced-list fixture, and a 501-item minimal-list fixture. The fixture contains only harmless dummy files and folders.
 - Explorer setup — PASS: a real Explorer window was opened on the disposable `small-matrix` parent with the representative Chinese/special-character file visibly selected while the parent remained open.
 - Explorer Send To and real Tk workflow — BLOCKED — desktop control reported active user input in another ChatGPT window before classic-context-menu navigation and the dedicated launcher could be exercised. No reliable Send To launch, argv, Tk interaction, Apply, or Undo result is claimed.
 - Live mutation scenarios — NOT RUN: no Apply, Undo, rename, delete, Send To install/uninstall, real user database access, Notes-root access, or valuable/unrelated file change occurred.
-- Existing USER CHECK items remain pending; no acceptance item was removed or inferred from automated evidence.
+- Classification — the blocked/unrun scenarios remain historical evidence and non-blocking residual real-world risk. They are not an active acceptance debt for ordinary development, and no scenario was changed to PASS or inferred from automated evidence.
+- Future handling — do not schedule a dedicated Explorer/Tk acceptance campaign by default. Treat normal user operation as the feedback surface; a reproducible real bug or explicit high-risk requirement can open a focused task or blocking USER CHECK.
 
 ## Migration Checkpoint cleanup verification
 
@@ -65,17 +66,17 @@ The migration verification was run against the post-adoption source/documentatio
 - Change-boundary review — PASS: only docs/project canonical documents changed; src/, tests/, pyproject.toml, workflow, config contract, schema, version, and entry points were untouched.
 - git diff --check — PASS.
 
-## Known limitations and evidence gaps
+## Known limitations and residual real-world risks
 
-Automated tests do not replace the following real-user checks:
+The following scenarios were not proven by automated evidence and remain residual risks, not standing blockers for ordinary development:
 
 1. Explorer Send To end-to-end with an open parent directory, single/multiple files and folders, Chinese names, spaces, common special characters, and exact argv fidelity.
 2. Real Tk continuity for reorder/sort plus numbering, immediate Apply after edits, manual override persistence, invalid-rule recovery, multi-round Apply/Undo, focus/keyboard behavior, and large-list presentation.
-3. Compatibility with real historical user SQLite rows or recovery_required state; no live database was read or changed during adoption.
-4. Notes wrapper convenience in the user's normal installed/PATH environment.
+3. Compatibility with real historical user SQLite rows or recovery_required state; no live database was read or changed during adoption. Verify this only when a future schema/data task requires it.
+4. Notes wrapper convenience in the user's normal installed/PATH environment; address this only if real user friction appears.
 
-These are pending USER CHECK items, not claims of automated pass.
+They remain `NOT RUN` where applicable, are not claims of automated pass, and are upgraded to blocking USER CHECK only under D13's explicit conditions.
 
 ## Migration status
 
-Canonical ownership is adopted. This Migration Checkpoint cleanup restores the durable Rename UX baseline, extends D13 into a bidirectional maturity gate, and separates narrative documents from implementation/CI evidence while recording currently absent specifications. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. This adoption and cleanup did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior. No normal feature/fix Plan should start before the final migration checkpoint is accepted.
+Canonical ownership is adopted. The post-migration framework now uses safe automatic commit/push delivery for completed Plans and treats high-cost Explorer/Tk checks as non-blocking residual risk by default while preserving honest evidence and all product safety invariants. The earlier Migration Checkpoint cleanup restored the durable Rename UX baseline and separated narrative documents from implementation/CI evidence while recording currently absent specifications. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. This policy adjustment did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior. Normal feature/fix Plans may proceed with relevant automated/review/smoke evidence; real-world interaction issues are reopened from concrete user feedback or explicit high-risk requirements.

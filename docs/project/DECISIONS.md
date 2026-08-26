@@ -52,9 +52,11 @@ The GUI action 撤销本次 undoes only the exact apply run completed by that wi
 
 Database, log, lock, and optional configuration live under the per-user application-data directory, not in the repository. SQLite schema version 4 preserves historical Notes records while adding module-specific Rename records and indexes. Existing durable state must not be treated as a disposable filesystem index.
 
-### D13 — Bidirectional maturity gate: evidence before freeze, restraint after maturity
+### D13 — Honest evidence, non-blocking manual acceptance, and restrained maturity
 
-Automated tests and CI are necessary but do not prove Explorer shell invocation or real Tk interaction, so the product must not be treated as frozen before the relevant real daily workflow evidence exists. Once the safety model, regression coverage, and real daily workflow are established, stop speculative hardening: reopen the area only for real user feedback, a Windows behavior issue, a regression, an explicit new requirement, or a reliable UI/integration automation oracle that can replace the manual check. This avoids both CI-only premature closure and endless theoretical hardening; pending Explorer/Tk/user-database checks remain explicitly pending in CURRENT_STATE.md.
+Automated tests, CI, static/diff review, and low-cost smoke must remain honest: they prove only the behavior they actually cover, and an unrun Explorer/Tk interaction remains `NOT RUN`, never `PASS`. For ordinary development, high-cost desktop acceptance is non-blocking by default. Relevant automated coverage, review, basic smoke, and normal-use feedback together provide the practical maturity evidence; an unrun manual scenario is a non-blocking residual risk, not a standing blocking debt.
+
+Escalate manual acceptance to a blocking USER CHECK only when the user explicitly requires it, a high-risk irreversible data/migration/release action cannot be adequately proven automatically, the task itself is interactive/device/environment acceptance, or a confirmed root cause can only be validated in the real environment. This does not weaken any file-safety, no-overwrite, identity, containment, recovery, or Undo invariant. Once the safety model, regression coverage, and normal use sufficiently support the current requirement, stop speculative hardening: reopen the area only for real user feedback, a Windows behavior issue, a regression, an explicit new requirement, or a reliable UI/integration automation oracle. This avoids both costly over-reliance on focus-stealing manual campaigns and endless theoretical hardening while keeping evidence truthful.
 
 ## Superseded directions
 

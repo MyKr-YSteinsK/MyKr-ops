@@ -76,9 +76,17 @@ Do not inspect, rewrite, migrate, clean, or use real user databases, logs, roots
 
 pyproject.toml owns package metadata and the current version is 0.1.0. The package entry points are mykr-ops and mykr-ops-rename; python -m mykr_ops is the thin module CLI entry. There is currently no formal release, deployment, or tag model. Do not bump the version or create release/deployment machinery without a direct requirement.
 
+## Delivery policy
+
+For a formally completed Plan, after required validation passes, the final diff has been reviewed, and no safety or scope conflict remains, Codex defaults to one focused commit and a push to the current branch's configured upstream. A separate user request to commit or push is not required. `TASK_RESULT` must report the branch, starting HEAD, resulting HEAD, commit status and message, push status, local/remote synchronization, and worktree status.
+
+This policy never permits force push or history rewriting. Do not mix unrelated changes, generated/private/runtime data, secrets, or unknown user data into the commit; do not bypass a failed required check or overwrite unknown remote history. Stop and report a delivery blocker when validation fails, the branch or upstream is unclear, unrelated changes cannot be safely separated, force push would be required, authentication/network/remote conflict prevents a safe push, or the change may contain secrets or private user data.
+
 ## Evidence and stop boundaries
 
-pytest, compileall, and Windows CI prove automated/package behavior only. They do not prove real Explorer Send To invocation or subjective Tk focus, keyboard, large-list, and multi-round interaction. Keep those real workflow checks explicitly pending in docs/project/CURRENT_STATE.md until performed with disposable data.
+pytest, compileall, Windows CI, and targeted tests prove only the behavior they actually cover; never describe an unrun Explorer/Tk interaction as PASS. Explorer/Tk and other high-cost desktop acceptance are non-blocking by default for ordinary development. Do not repeatedly launch a Computer Use or manual matrix campaign merely to close a historical check. Ordinary Plans use relevant automated tests, diff/code review, and necessary low-cost technical smoke; normal user operation is a primary surface for finding real interaction problems, which then become a focused fix task when reproducible.
+
+Upgrade a desktop scenario to a blocking USER CHECK only when the user explicitly requires it, a high-risk irreversible data/migration/release action cannot be adequately proven automatically, the task itself is interactive/device/environment acceptance, or a confirmed root cause can only be validated in the real environment. Lowering this manual-acceptance gate never lowers file-safety, no-overwrite, identity, containment, recovery, or Undo invariants.
 
 Stop and report instead of guessing when work would require:
 
