@@ -51,6 +51,14 @@ The migration verification was run against the post-adoption source/documentatio
 - Documentation/metadata review — PASS: product source, tests, pyproject.toml, workflow, config contract, schema, and version were not intentionally changed.
 - Ownership/private-boundary review — PASS: canonical owners are distinct; legacy handoffs are not tracked or active; no database, log, Send To shortcut, virtual environment, or other private/generated artifact is part of the change set.
 
+## OPS-Plan02 acceptance evidence
+
+- Disposable fixture setup — PASS: `D:/CS/temp/MyKrops/OPS-Plan02-Rename-acceptance-20260826` contains a small six-item matrix, a 220-item reduced-list fixture, and a 501-item minimal-list fixture. The fixture contains only harmless dummy files and folders.
+- Explorer setup — PASS: a real Explorer window was opened on the disposable `small-matrix` parent with the representative Chinese/special-character file visibly selected while the parent remained open.
+- Explorer Send To and real Tk workflow — BLOCKED — desktop control reported active user input in another ChatGPT window before classic-context-menu navigation and the dedicated launcher could be exercised. No reliable Send To launch, argv, Tk interaction, Apply, or Undo result is claimed.
+- Live mutation scenarios — NOT RUN: no Apply, Undo, rename, delete, Send To install/uninstall, real user database access, Notes-root access, or valuable/unrelated file change occurred.
+- Existing USER CHECK items remain pending; no acceptance item was removed or inferred from automated evidence.
+
 ## Migration Checkpoint cleanup verification
 
 - Canonical documentation text and ownership checks — PASS: durable UX, bidirectional maturity, implementation-evidence ownership, absent-specification, and superseded-direction boundaries are recorded in their canonical owners.
