@@ -1,247 +1,90 @@
-# AGENTS.md
-
-## Project
+# MyKr-ops repository contract
 
-`mykr-ops` is a Windows-first, local-first personal automation toolkit.
+This file is the only active repository-specific instruction owner for MyKr-ops. The generic development workflow, verification guidance, and artifact contracts come from the active Codex skills; do not duplicate them here.
 
-Its baseline behavior must remain deterministic and usable without AI. AI may be added later only as optional assistance for ambiguous recognition or interaction; it must not become a hidden dependency for basic file operations.
+## Product boundary
 
-The project should grow through small, verified modules driven by real usage. Do not turn it into a generic automation platform prematurely.
+MyKr-ops is a single-user, Windows-first, local-first personal automation toolkit. Its baseline behavior is deterministic and does not require AI, a network service, cloud synchronization, or a background process. The current enabled capabilities are:
 
-## Current priorities
+- Study Note Organizer;
+- Batch Rename for explicitly selected files and folders;
+- the Rename Explorer Send To integration.
 
-1. Keep file operations safe, explicit, traceable, and reversible where practical.
-2. Prefer the smallest implementation that fully satisfies the current task.
-3. Preserve deterministic behavior.
-4. Avoid unnecessary runtime dependencies, abstractions, services, and permanent documentation.
-5. Keep Windows path behavior and filesystem edge cases explicit.
+Keep the application as one Python CLI/package with small modules and standard-library runtime dependencies. Do not introduce account systems, cloud sync, AI runtime dependencies, GUI frameworks, watchers, services, plugin/workflow platforms, or cross-platform abstractions unless a separately authorized product requirement changes this boundary.
 
-## Scope discipline
+## Ownership and source of truth
 
-Do not expand the active task unless the supplied execution plan explicitly requires it.
+Use the following ownership boundaries:
 
-Do not add any of the following by default:
+- AGENTS.md: this repo-specific safety, platform, command, state, and release contract;
+- docs/project/PROJECT_BRIEF.md: stable product identity, scope, and long-lived invariants;
+- docs/project/DECISIONS.md: durable rationale and supersession relationships;
+- docs/project/CURRENT_STATE.md: mutable implementation facts, verification evidence, limitations, and pending user checks;
+- docs/project/SUPPORTING_DOCS_MANIFEST.md: the active supporting-document map;
+- README.md: user and operations reference only;
+- config.example.toml: the minimal Notes configuration reference;
+- pyproject.toml: package metadata, Python requirement, version, and entry-point owner;
+- .github/workflows/test.yml: the repository CI verification definition;
+- source code, tests, and the SQLite schema/migration code: implementation behavior and compatibility truth.
 
-- account systems;
-- cloud synchronization;
-- AI integrations;
-- GUI frameworks;
-- background services;
-- realtime filesystem watchers;
-- plugin frameworks;
-- workflow engines;
-- microservices;
-- message queues;
-- telemetry or analytics;
-- broad refactors;
-- unrelated dependency upgrades;
-- generic rule engines;
-- speculative abstractions for future modules.
+Plans, handoffs, ChatGPT/Codex exports, audit snapshots, generated files, editor metadata, and runtime state are not project-state owners. Any .handoff material that remains on a working machine is historical only, ignored by Git, and must not be treated as an execution contract.
 
-When a future requirement is not needed by the current implementation, leave a clear extension point only if it naturally emerges from the current design. Do not create unused interfaces or placeholder modules.
+Do not copy a temporary plan wholesale into permanent documentation. Extract only durable rationale that remains supported by the current implementation and tests.
 
-## Source of truth
+## Active command contract
 
-The permanent source of truth is:
+### Notes
 
-1. current code;
-2. automated tests;
-3. database migrations or other irreversible evolution files, when they exist;
-4. `README.md` and other necessary permanent documentation;
-5. Git history;
-6. verified runtime behavior.
+- mykr-ops notes is side-effect-free preview; mykr-ops notes --apply is the explicit mutation command.
+- mykr-ops undo is the Notes undo command. mykr-ops history and mykr-ops history --run N inspect recorded runs.
+- Notes inspect only direct ordinary lowercase .md files in the configured source directory. The filename contract uses sequence 01–99 and splits the final two underscores into first-level directory and course; the topic may contain underscores.
+- Defaults are D:/Downloads and D:/Study. An optional per-user %LOCALAPPDATA%\mykr-ops\config.toml (fallback %USERPROFILE%\.mykr-ops\config.toml) may provide only [notes].source_dir and [notes].study_root.
+- The study root must already be an ordinary readable directory. Only its first-level and course child directories may be created. Duplicate, conflict, invalid, failed, and ignored items remain untouched and are reported.
 
-Temporary plans and handoff files are read-only execution inputs. They are not project state.
+### Rename
 
-Do not:
+- mykr-ops rename gui PATH [PATH ...] operates only on the explicitly selected ordinary files/folders from one ordinary parent directory. It is non-recursive and never moves across directories.
+- mykr-ops rename undo undoes the latest eligible Rename apply batch. The GUI action 撤销本次 is bound to the exact apply run completed by that window.
+- mykr-ops rename install-sendto and mykr-ops rename uninstall-sendto manage only the per-user, owned MyKr-ops Rename Send To entry. The shortcut uses the dedicated mykr-ops-rename GUI launcher; it is not a shell extension or a universal launcher.
+- Rename has transform and independent numbering modes. Numbering follows the current displayed row order. File extensions are locked, folders edit their complete name, and a manual stem overrides automatic rules until restored or cleared. Sorting and drag reordering change order without erasing manual overrides.
+- Apply revalidates the current plan and, after success, rebases the GUI on actual paths so another round can be edited. There is no permanent post-Apply freeze.
+- There is no hard item-count Apply ban. The GUI uses normal presentation through 200 items, reduced presentation for 201–500, and minimal presentation above 500; plan validity and filesystem safety determine whether Apply is enabled.
 
-- edit a supplied temporary plan;
-- mark completion status inside it;
-- rename or delete it;
-- commit it;
-- copy the plan wholesale into permanent documentation.
+## File-safety invariants
 
-## File operation safety
+These invariants are product behavior, not optional implementation preferences:
 
-Any feature that moves, renames, creates, or deletes user files must follow these rules unless the active task explicitly defines stricter behavior:
+- Preview must not create directories, mutate files, write actual operation records, create Send To entries, or hash large files unnecessarily.
+- Every mutation requires an explicit Apply/Undo path and revalidates source, destination, parent, object identity, and containment immediately before mutation. Never overwrite an existing file, folder, or other filesystem entry.
+- Ordinary-object checks must reject symbolic links, junctions, and other reparse points. Ambiguous case-insensitive matches, invalid Windows names, occupied destinations, and unsupported filesystem states are conflicts or failures, not guesses.
+- Notes moves stay inside the configured roots, preserve source content, and verify size/mtime/content before and after the move. Cross-volume moves fail safely. Undo never overwrites a newer or unrelated object.
+- Rename stays inside one verified parent. Its Windows mutation path is handle-relative, binds the source and verified parent identities, uses ReplaceIfExists = False, and verifies the resulting identity. The portable fallback exists only for non-Windows temporary-directory tests; do not replace the Windows path with an absolute-path or copy/delete fallback.
+- Filesystem inspection and mutation access are separate concerns: path/lstat/scandir/hash inspection may establish a plan, but the mutation boundary must reopen and verify the current handles/identities. Do not trust a stale preview snapshot.
+- Rename changed items use unique same-parent temporary names before finalization, so swaps, cycles, and case-only renames remain no-overwrite operations. A failed batch is rolled back when it can be proven safe.
+- Durable prepared/transitional operations are reconciled under the shared local mutation lock. A missing, ambiguous, externally occupied, or identity-inconsistent state becomes recovery_required, leaves paths untouched, and blocks later MyKr-ops mutations until manually resolved. Do not weaken validation to make a test or command pass.
+- Recovery is module-aware: Notes records and Rename records remain separate, and unresolved work in either module is a mutation blocker. SQLite schema version 4 and existing history must remain compatible unless a separately authorized data migration is required.
 
-- preview by default where practical;
-- require an explicit apply action before modifying files;
-- never overwrite an existing file;
-- never silently delete a user file;
-- validate source and destination paths immediately before execution;
-- verify that computed destination paths remain within the configured root;
-- do not follow symbolic links, junctions, or other reparse points unless explicitly required;
-- treat ambiguous matches as conflicts rather than guesses;
-- detect multiple source files resolving to one destination before execution;
-- record successful modifications and meaningful failures;
-- continue after isolated file failures when the task permits;
-- do not record an operation as successful until the resulting filesystem state is verified;
-- undo must never overwrite newer user data;
-- automatic directory removal is allowed only for directories created by the recorded operation and still empty.
+## State, privacy, and release boundary
 
-Do not weaken safety validation to make tests or local execution pass.
+Runtime state belongs outside the repository:
 
-## Windows-specific requirements
+- %LOCALAPPDATA%\mykr-ops\mykr-ops.db, mykr-ops.log, and mykr-ops.lock;
+- fallback %USERPROFILE%\.mykr-ops\ when LOCALAPPDATA is unavailable;
+- optional user configuration at the same per-user location.
 
-Assume the primary runtime environment is Windows 10 or Windows 11.
+Do not inspect, rewrite, migrate, clean, or use real user databases, logs, roots, Send To entries, or files as proof of a documentation/framework change. Tests use temporary directories and must not touch D:/Downloads, D:/Study, or live user state.
 
-Pay attention to:
+pyproject.toml owns package metadata and the current version is 0.1.0. The package entry points are mykr-ops and mykr-ops-rename; python -m mykr_ops is the thin module CLI entry. There is currently no formal release, deployment, or tag model. Do not bump the version or create release/deployment machinery without a direct requirement.
 
-- case-insensitive path matching;
-- reserved device names;
-- invalid filename characters;
-- trailing spaces and periods;
-- path containment;
-- drive-letter behavior;
-- locked files;
-- symbolic links;
-- junctions;
-- reparse points;
-- long or unusual Unicode names;
-- files changing between scan and apply.
+## Evidence and stop boundaries
 
-Do not determine path containment with raw string-prefix checks.
+pytest, compileall, and Windows CI prove automated/package behavior only. They do not prove real Explorer Send To invocation or subjective Tk focus, keyboard, large-list, and multi-round interaction. Keep those real workflow checks explicitly pending in docs/project/CURRENT_STATE.md until performed with disposable data.
 
-## Architecture
+Stop and report instead of guessing when work would require:
 
-Prefer simple modules with explicit responsibilities.
-
-For the current project scale:
-
-- use a single CLI application;
-- use Python standard-library facilities when sufficient;
-- use SQLite directly through `sqlite3`;
-- keep module-specific behavior separate from shared filesystem, configuration, and persistence helpers;
-- avoid ORM, dependency injection frameworks, plugin registries, and service containers;
-- keep business logic testable against temporary directories instead of real user paths.
-
-Add new permanent architecture documentation only when the repository becomes difficult to understand from the code and README alone.
-
-A separate project map is not required at the current project size. Reconsider it only after multiple independent modules and shared infrastructure make navigation genuinely difficult.
-
-## Configuration
-
-Configuration should be minimal and explicit.
-
-- Provide safe defaults when the active requirement defines them.
-- Keep user-specific state outside the repository.
-- Do not commit runtime databases, logs, secrets, caches, or local configuration.
-- Do not invent environment variables or configuration layers without a current need.
-- Fail clearly when required roots do not exist or are unsafe.
-
-## Persistence
-
-Use SQLite only for durable state that supports real behavior such as operation history and undo.
-
-- Use parameterized queries.
-- Keep transactions focused.
-- Record actual execution, not speculative preview plans, unless a requirement explicitly says otherwise.
-- Do not treat SQLite as a full index of the user's filesystem.
-- Schema changes must preserve existing recorded operations where practical.
-
-## CLI behavior
-
-CLI output should be readable to a non-expert user.
-
-- Show concise summaries.
-- Show reasons for duplicate, conflict, invalid, skipped, and failed items.
-- Do not print full tracebacks during normal use.
-- Write diagnostic tracebacks to logs when helpful.
-- Return meaningful non-zero exit codes for command-level failure.
-- Do not require interactive prompts when an explicit apply flag already represents confirmation.
-
-Windows `.cmd` scripts may wrap CLI commands, but must not duplicate business logic.
-
-## Testing and verification
-
-Use targeted verification first.
-
-For filesystem features, tests should cover:
-
-- parsing and validation;
-- path resolution;
-- preview side-effect freedom;
-- conflict handling;
-- execution behavior;
-- partial failure;
-- persistence;
-- undo safety;
-- Windows-specific edge cases that can be represented portably.
-
-Tests must use temporary directories and must not modify the user's real paths.
-
-Do not default to:
-
-- scanning the entire repository;
-- running unrelated test suites;
-- adding broad integration infrastructure;
-- introducing mocks where real temporary filesystem operations are clearer.
-
-Expand verification only when risk justifies it.
-
-## Documentation
-
-Keep permanent documentation small and accurate.
-
-`README.md` should explain:
-
-- project purpose;
-- supported environment;
-- installation;
-- commands;
-- current filename or input contracts;
-- safety behavior;
-- state and log locations;
-- testing.
-
-Do not create by default:
-
-- development plans;
-- patch logs;
-- roadmaps;
-- decision logs;
-- project maps;
-- duplicated architecture documents.
-
-Update permanent documentation only when behavior, setup, or stable architecture changes.
-
-## Change discipline
-
-Before modifying code:
-
-1. inspect only files relevant to the task;
-2. understand current behavior and tests;
-3. identify unrelated working-tree changes;
-4. avoid touching unrelated files.
-
-During implementation:
-
-- keep changes focused;
-- do not reformat unrelated code;
-- do not rename public commands or persistent fields without need;
-- add regression tests for behavior changes;
-- stop rather than improvising around unsafe or ambiguous filesystem state.
-
-## Git completion rules
-
-After required verification passes:
-
-1. review the diff and exclude unrelated or generated files;
-2. create one focused commit;
-3. push the current branch to its configured upstream;
-4. report the commit SHA and push result.
-
-Stop and report the blocker when:
-
-- required verification fails;
-- secrets or private user data may be included;
-- unrelated changes cannot be separated;
-- the current branch is ambiguous;
-- the remote or upstream is ambiguous;
-- push would require force;
-- authentication or environment problems prevent a safe push.
-
-Do not use force push.
-
-Use `frugal-dev-runner`. Do not expand scope.
+- touching live user data or installing/removing a real user Send To shortcut;
+- resolving an ambiguous recovery state, reparse point, identity, containment, or no-overwrite condition by weakening the safety model;
+- destructive migration or an unrecognized database schema;
+- unsupported filesystem semantics or a required cross-directory rename;
+- changing a durable decision without reconciling docs/project/DECISIONS.md and current evidence;
+- reactivating an archived plan, adding a feature/fix/refactor under a documentation migration, or inventing a release/deployment model.

@@ -2,6 +2,8 @@
 
 MyKr-ops is a deterministic, local-first Windows automation toolkit. It currently provides a safe study-note organizer and an explicit batch rename tool for files and folders you select.
 
+Maintainer-facing project intent, rationale, current state, and supporting-document ownership live in [docs/project/](docs/project/). This README remains the user and operations reference.
+
 ## Requirements and installation
 
 Use Windows 10 or 11 and Python 3.12 or newer.
@@ -68,7 +70,7 @@ MyKr-ops Rename works only on the files and folders you explicitly select. Selec
 mykr-ops rename gui "D:\Examples\draft report.txt" "D:\Examples\draft folder"
 ```
 
-The GUI is in Simplified Chinese. Its **常规重命名** mode supports literal find/replace, prefix, and suffix. Its **连续编号** mode independently generates names such as `01.jpg`, `02.jpg`, or `EP-001-1080P.mkv`; the current displayed order determines the number sequence. Sort and drag ordering are available, and a per-item manual name always takes precedence until you choose **恢复自动**. File extensions are locked; folders use their full name. It accepts files, folders, mixed selections, Unicode, spaces, and other normal Windows filename characters, but rejects reparse points, different parent directories, invalid names, reserved device names, extension changes, and occupied targets. More than 500 entries use a reduced UI mode intended for planning and preview.
+The GUI is in Simplified Chinese. Its **常规重命名** mode supports literal find/replace, prefix, and suffix. Its **连续编号** mode independently generates names such as `01.jpg`, `02.jpg`, or `EP-001-1080P.mkv`; the current displayed order determines the number sequence. Sort and drag ordering are available, and a per-item manual name always takes precedence until you choose **恢复自动**. File extensions are locked; folders use their full name. It accepts files, folders, mixed selections, Unicode, spaces, and other normal Windows filename characters, but rejects reparse points, different parent directories, invalid names, reserved device names, extension changes, and occupied targets. For 201–500 entries the GUI uses a reduced presentation, and above 500 it uses a minimal presentation intended for planning and preview. There is no hard item-count Apply ban: Apply is enabled when the current plan is valid, safe, and contains a change.
 
 The preview is side-effect free. Apply is enabled only when there is at least one change and every selected target is safe. After a successful apply, the window refreshes to the actual new names with fresh rules so you can continue with another round; **撤销本次** always targets only that latest round. The operation revalidates each selected object and parent directory immediately before it starts, never overwrites an existing entry, and uses temporary same-directory names so swaps, cycles, and case-only renames are safe. If any step fails, MyKr-ops attempts to restore the entire batch; an ambiguous interruption is recorded as `recovery_required` and blocks later file mutations rather than guessing.
 
