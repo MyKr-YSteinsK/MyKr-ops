@@ -10,7 +10,9 @@ Last reconciled: 2026-08-26.
 - Upstream: origin/main
 - Adoption starting HEAD: ad8b00e8a1fde5ae2d275fd4c263525707e70e16 (fix: allow rename planning with explorer-held directories)
 - Adoption resulting HEAD: the single migration commit reported in the formal TASK_RESULT; this document intentionally uses the delivery record rather than a self-referential commit hash.
-- Worktree: clean after the adoption change set.
+- Migration Checkpoint cleanup starting HEAD: 80ff36c52119715ff401e4620e26a8ef3ff9c534 (chore: adopt canonical project ownership)
+- Migration Checkpoint cleanup resulting HEAD: the formal TASK_RESULT delivery record; this document intentionally uses the delivery record rather than a self-referential commit hash.
+- Worktree: clean after the adoption and Migration Checkpoint cleanup change sets.
 
 ## Package and entry points
 
@@ -49,6 +51,12 @@ The migration verification was run against the post-adoption source/documentatio
 - Documentation/metadata review — PASS: product source, tests, pyproject.toml, workflow, config contract, schema, and version were not intentionally changed.
 - Ownership/private-boundary review — PASS: canonical owners are distinct; legacy handoffs are not tracked or active; no database, log, Send To shortcut, virtual environment, or other private/generated artifact is part of the change set.
 
+## Migration Checkpoint cleanup verification
+
+- Canonical documentation text and ownership checks — PASS: durable UX, bidirectional maturity, implementation-evidence ownership, absent-specification, and superseded-direction boundaries are recorded in their canonical owners.
+- Change-boundary review — PASS: only docs/project canonical documents changed; src/, tests/, pyproject.toml, workflow, config contract, schema, version, and entry points were untouched.
+- git diff --check — PASS.
+
 ## Known limitations and evidence gaps
 
 Automated tests do not replace the following real-user checks:
@@ -62,4 +70,4 @@ These are pending USER CHECK items, not claims of automated pass.
 
 ## Migration status
 
-Canonical ownership is adopted. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. This adoption did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior.
+Canonical ownership is adopted. This Migration Checkpoint cleanup restores the durable Rename UX baseline, extends D13 into a bidirectional maturity gate, and separates narrative documents from implementation/CI evidence while recording currently absent specifications. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. This adoption and cleanup did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior. No normal feature/fix Plan should start before the final migration checkpoint is accepted.

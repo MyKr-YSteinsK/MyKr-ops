@@ -30,6 +30,8 @@ Notes and Rename are separate modules with separate planning and operation seman
 
 Notes preview by default and require --apply. Rename provides a dedicated GUI with transform and independent numbering modes, current-row-order numbering, extension locking, manual override precedence, restore/clear controls, inline validation, explicit Apply, fresh rebase for another round, and safe exact GUI Undo. There is no hard item-count Apply limit; large lists use reduced or minimal presentation modes.
 
+The intended daily Windows path is Explorer selection → Send To → MyKr-ops Rename → a Chinese-language GUI. The experience should remain a lightweight Windows utility: light theme, restrained feedback and animation, clear state and summary feedback, and no SaaS-dashboard, glass/glow/gradient, or thumbnail-heavy visual treatment. Apply is itself the mutation confirmation; ordinary validation errors belong in row/state feedback and the summary, while modal dialogs are reserved for fatal conditions. List-size modes reduce presentation only (normal through 200 items, reduced for 201–500, minimal above 500); they do not change plan validity, Apply availability, or safety semantics.
+
 ## Stable non-goals
 
 MyKr-ops is not a generic automation platform. Account systems, cloud synchronization, network APIs, background services/watchers, AI-first control, OCR/metadata classification, recursive or cross-directory rename, automatic conflict renaming/deletion, arbitrary multi-level rollback, shell extensions, a Windows 11 first-level context-menu integration, and a universal GUI shell are outside the current product boundary.

@@ -52,9 +52,9 @@ The GUI action 撤销本次 undoes only the exact apply run completed by that wi
 
 Database, log, lock, and optional configuration live under the per-user application-data directory, not in the repository. SQLite schema version 4 preserves historical Notes records while adding module-specific Rename records and indexes. Existing durable state must not be treated as a disposable filesystem index.
 
-### D13 — Evidence before calling a module frozen
+### D13 — Bidirectional maturity gate: evidence before freeze, restraint after maturity
 
-Automated tests and CI are necessary but do not prove Explorer shell invocation or real Tk interaction. A module is not called frozen until the relevant real workflow evidence exists; pending Explorer/Tk/user-database checks remain explicitly pending in CURRENT_STATE.md.
+Automated tests and CI are necessary but do not prove Explorer shell invocation or real Tk interaction, so the product must not be treated as frozen before the relevant real daily workflow evidence exists. Once the safety model, regression coverage, and real daily workflow are established, stop speculative hardening: reopen the area only for real user feedback, a Windows behavior issue, a regression, an explicit new requirement, or a reliable UI/integration automation oracle that can replace the manual check. This avoids both CI-only premature closure and endless theoretical hardening; pending Explorer/Tk/user-database checks remain explicitly pending in CURRENT_STATE.md.
 
 ## Superseded directions
 
