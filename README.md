@@ -6,11 +6,58 @@ Maintainer-facing project intent, rationale, current state, and supporting-docum
 
 ## Requirements and installation
 
-Use Windows 10 or 11 and Python 3.12 or newer.
+Use Windows 10 or 11 and Python 3.12 or newer. The Rename GUI also needs a normal Windows Python installation with Tcl/Tk included; the command-line Notes/Rename operations do not need a third-party runtime dependency. A desktop session can verify the GUI prerequisite with:
+
+```powershell
+py -c "import tkinter as tk; root = tk.Tk(); root.destroy()"
+```
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+## New computer and switching machines
+
+A clone contains the code, tests, packaging metadata, command wrappers, and active project documentation. The virtual environment, editor settings, caches, local configuration, SQLite history, logs, locks, and disposable test data are intentionally machine-local and are not part of the repository.
+
+### Fresh setup
+
+Install Git and Python 3.12 or newer on Windows, then run:
+
+```powershell
+git clone https://github.com/MyKr-YSteinsK/MyKr-ops.git
+Set-Location MyKr-ops
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m mykr_ops --help
+```
+
+The package has no runtime dependencies. The optional `dev` extra installs pytest for verification. If the editable install reports a transient package-download error, rerun the same command; no project-local package cache is required. A Python distribution without Tcl/Tk can still run the CLI but cannot provide the Rename GUI or its widget-level tests.
+
+### What must be restored separately
+
+- The real Notes files and folders under `D:\Downloads` and `D:\Study` (or the configured roots) are user data, not project files. Sync or back them up with the user's chosen file-storage method; MyKr-ops does not sync them.
+- An optional Notes configuration belongs at `%LOCALAPPDATA%\mykr-ops\config.toml` (fallback `%USERPROFILE%\.mykr-ops\config.toml`). Start from the tracked `config.example.toml` and copy/edit it only when the new computer uses different roots. Never commit a personal config containing machine-specific paths.
+- `%LOCALAPPDATA%\mykr-ops\mykr-ops.db` (fallback `%USERPROFILE%\.mykr-ops\mykr-ops.db`) is private operation history used by History and Undo. It is not needed to run a fresh checkout. To preserve history, close MyKr-ops first and make a separate backup of the database; restore it only when the configured roots and recorded paths still make sense. Do not merge or concurrently sync databases from two computers, and do not restore one blindly over an unresolved `recovery_required` state. Logs and the lock file are not required for recovery and should not be copied.
+- The Explorer Send To shortcut is per-user Windows state, not Git content. After installing the package on each computer, run `mykr-ops rename install-sendto` when that integration is wanted.
+
+### Switching between two computers
+
+Before leaving the computer that was used for development, finish the intended source/documentation change and push it. Review the files before adding them so local configuration, databases, logs, caches, and secrets are never staged. On the other computer, update the checkout before doing new work:
+
+```powershell
+git status --short --branch
+git pull --ff-only
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+Rerun the install when `pyproject.toml` or the development dependencies change. Keep one computer as the active writer for a simple personal workflow: pull before editing and push after finishing. If both computers have local commits, stop instead of force-pushing; reconcile the branches deliberately, then update the other checkout with `git pull --ff-only`. A non-fast-forward or dirty-worktree error is a synchronization warning, not a reason to discard local work.
+
+When starting a later Plan on the new computer, give the new Plan's objective and acceptance criteria explicitly and ask Codex to read `AGENTS.md`, `README.md`, `docs/project/PROJECT_BRIEF.md`, `docs/project/DECISIONS.md`, `docs/project/CURRENT_STATE.md`, and `docs/project/SUPPORTING_DOCS_MANIFEST.md` first. Those files plus the current Git checkout are the continuity boundary; ignored local state and old `.handoff` material are not. A suitable starting instruction is:
+
+```text
+在当前 checkout 继续执行 Plan-4。先检查 git status，并读取 AGENTS.md、README.md、docs/project/PROJECT_BRIEF.md、docs/project/DECISIONS.md、docs/project/CURRENT_STATE.md、docs/project/SUPPORTING_DOCS_MANIFEST.md；以当前 Git、代码、测试和 CI 为事实，明确本 Plan 的目标与验收标准，不把旧 .handoff/计划当执行契约。完成后按 AGENTS.md 做相关验证、审查，并报告 commit/push 与工作树状态。
 ```
 
 ## Study notes

@@ -1,11 +1,11 @@
 # MyKr-ops Current State
 
-Last reconciled: 2026-08-27.
+Last reconciled: 2026-09-08.
 
 ## Repository identity
 
 - Repository: MyKr-YSteinsK/MyKr-ops
-- Local path: D:/CS/MyKr-ops
+- Local checkout path: machine-specific; do not treat the current checkout location as a portable project path.
 - Branch: main
 - Upstream: origin/main
 - Adoption starting HEAD: ad8b00e8a1fde5ae2d275fd4c263525707e70e16 (fix: allow rename planning with explorer-held directories)
@@ -66,6 +66,19 @@ The migration verification was run against the post-adoption source/documentatio
 - Change-boundary review — PASS: only docs/project canonical documents changed; src/, tests/, pyproject.toml, workflow, config contract, schema, version, and entry points were untouched.
 - git diff --check — PASS.
 
+## New-computer migration audit
+
+The final migration audit was run on 2026-09-08 against the current `main` checkout. It did not inspect or modify real user Notes roots, the per-user database/log/lock state, or the Windows Send To folder.
+
+- Git completeness — PASS: the worktree has no untracked non-ignored files, `main` tracks `origin/main`, local HEAD and the remote `main` ref are `b5a9614fa64712801add0031e7044686af6503a4`, and a full fresh clone reproduced that HEAD with 42 tracked files.
+- Repository structure — PASS: there are no tags, `.gitmodules` file, Git submodule gitlinks, or Git LFS-managed paths. Git LFS is installed on the audit machine but is not required to restore this repository.
+- Object integrity — PASS: `git fsck --full --no-reflogs --connectivity-only` completed successfully. A few local dangling objects are unreachable historical snapshots and are not part of the current worktree or remote recovery path.
+- Ignored/local material — PASS: the only present ignored checkout artifacts are the virtual environment, editor/cache directories, Python caches, pytest cache, and editable-install metadata. They are reproducible and not required in Git. The runtime lock is now covered by `*.lock`, matching the documented per-user database/log/lock boundary.
+- Secret and environment review — PASS: no secret-like filenames or tracked private-key/token patterns were found; no matching project/credential environment-variable names were present; the origin URL has no embedded credentials. The tracked configuration is an example only.
+- Clean-clone restore — PASS: README's venv and editable-install commands completed after one transient package-download retry; module and console help, `compileall`, and a full pytest run passed in the fresh clone. With a writable temporary directory, the result was `176 passed, 15 skipped`; skips were due to symlink privilege/case-variant platform limits, the native comparison branch, and unavailable Tcl/Tk widgets, not failed assertions.
+- Audit-machine caveats — the default pytest run first hit a permission-denied pre-existing system `pytest-of-<user>` directory, and default Git HTTPS access hit a local Schannel credential error. A writable temporary directory and a per-command OpenSSL transport override both succeeded. These are host-environment issues, not repository dependencies; a new computer must have a writable temp directory and working GitHub credentials for push.
+- External user state — the real Notes files, optional per-user config, operation database/history, logs, lock, and per-user Send To shortcut remain outside Git by design. They need deliberate per-computer backup/recreation only when the user wants continuity of data or integration state.
+
 ## Known limitations and residual real-world risks
 
 The following scenarios were not proven by automated evidence and remain residual risks, not standing blockers for ordinary development:
@@ -79,4 +92,4 @@ They remain `NOT RUN` where applicable, are not claims of automated pass, and ar
 
 ## Migration status
 
-Canonical ownership is adopted. The post-migration framework now uses safe automatic commit/push delivery for completed Plans and treats high-cost Explorer/Tk checks as non-blocking residual risk by default while preserving honest evidence and all product safety invariants. The earlier Migration Checkpoint cleanup restored the durable Rename UX baseline and separated narrative documents from implementation/CI evidence while recording currently absent specifications. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. This policy adjustment did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior. Normal feature/fix Plans may proceed with relevant automated/review/smoke evidence; real-world interaction issues are reopened from concrete user feedback or explicit high-risk requirements.
+Canonical ownership is adopted. The post-migration framework now uses safe automatic commit/push delivery for completed Plans and treats high-cost Explorer/Tk checks as non-blocking residual risk by default while preserving honest evidence and all product safety invariants. The earlier Migration Checkpoint cleanup restored the durable Rename UX baseline and separated narrative documents from implementation/CI evidence while recording currently absent specifications. The root AGENTS.md is repo-specific, the three project-state documents and supporting manifest are present, README pointers/contracts are reconciled, and legacy .handoff plans have been deactivated as historical material and archived outside the repository. The 2026-09-08 audit also confirmed that a fresh clone can recreate the development environment and run the project; only user-owned data/integration state and host-specific Git/temp permissions require separate handling. This policy adjustment did not intentionally change product source behavior, UI behavior, business logic, schema, entry-point semantics, file-safety semantics, version, or release behavior. Normal feature/fix Plans may proceed with relevant automated/review/smoke evidence; real-world interaction issues are reopened from concrete user feedback or explicit high-risk requirements.

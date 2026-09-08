@@ -20,6 +20,7 @@ config.toml
 *.db-shm
 *.db-wal
 *.log
+*.lock
 
 # Editors and Windows
 .vscode/
